@@ -1,0 +1,287 @@
+# ============================================================================
+# Fantasy Football ML - project configuration
+#
+# Every tunable setting in this project lives here. Source code should read
+# values from this file rather than hard coding them, so that experiments can
+# be run by editing configuration instead of editing Python.
+# ============================================================================
+
+project:
+  name: fantasy-football-ml
+  random_seed: 42
+
+
+# ----------------------------------------------------------------------------
+# Data pull settings
+# ----------------------------------------------------------------------------
+data:
+  # Seasons to download from nflreadpy. Set end_season to null to use
+  # nflreadpy.get_current_season() at runtime.
+  start_season: 2016
+  end_season: null
+
+  # Skill positions modeled. Kickers and team defenses are out of scope.
+  positions:
+    - QB
+    - RB
+    - WR
+    - TE
+
+  # Tables pulled by src/ffml/data/ingest.py. Set a table to false to skip it.
+  tables:
+    player_stats: true      # load_player_stats  - backbone table, target and features
+    schedules: true         # load_schedules     - opponent, home/away, betting lines
+    snap_counts: true       # load_snap_counts   - playing time
+    rosters_weekly: true    # load_rosters_weekly- team and active status by week
+    players: true           # load_players       - id crosswalk and birthdate
+    ff_opportunity: true    # load_ff_opportunity- expected fantasy points
+    depth_charts: true      # load_depth_charts  - expected role
+    injuries: true          # load_injuries      - status and practice participation
+    pbp: false              # load_pbp           - deferred to a later version
+
+  paths:
+    raw: data/raw
+    processed: data/processed
+    predictions: data/predictions
+    models: models
+
+  # Drop player-weeks where the player was not active. Bye weeks and inactive
+  # games are not zero-point performances; they are absent performances, and
+  # training on them as zeros teaches the model the wrong thing.
+  drop_inactive_weeks: true
+
+
+# ----------------------------------------------------------------------------
+# League scoring rules
+#
+# These are the actual rules for this league, taken from the Yahoo settings
+# page. They differ from both prebuilt nflverse fantasy point columns, so the
+# target must be computed from box score statistics in src/ffml/data/clean.py.
+#
+# Differences from the built-in fantasy_points_ppr column:
+#   1. Passing yards are 20 per point here, not 25.
+#   2. Interceptions cost 1 point here, not 2.
+#   3. There is a 100 yard rushing bonus, which no built-in column includes.
+#   4. There is a 100 yard receiving bonus, same reason.
+#
+# Yardage rules are written as "yards per point" to match how the league site
+# displays them, which reduces transcription mistakes. The scoring function
+# divides yards by this number rather than multiplying.
+#
+# NOTE FOR IMPLEMENTATION: verify the exact column names against the loaded
+# player stats frame before writing the scoring function. The nflverse stats
+# schema has been revised over time, and names such as `interceptions` versus
+# `passing_interceptions` vary by version. There is also no single fumbles lost
+# column; it is the sum of the sack, rushing, and receiving fumble lost columns.
+# ----------------------------------------------------------------------------
+scoring:
+  format_name: "Yahoo custom - full PPR with yardage bonuses"
+
+  # False means the target is computed from box score stats rather than read
+  # from a prebuilt column. Leave this false for this league.
+  use_prebuilt_column: false
+
+  # Name of the target column created by clean.py.
+  target_column: fantasy_points_league
+
+  passing:
+    yards_per_point: 20
+    touchdown: 4
+    interception: -1
+    two_point_conversion: 2
+
+  rushing:
+    yards_per_point: 10
+    touchdown: 6
+    two_point_conversion: 2
+    bonus:
+      threshold_yards: 100
+      points: 3
+      # False awards the bonus once at the threshold, so a 200 yard game still
+      # earns 3 points. True awards it again at every multiple of the
+      # threshold. Yahoo normally does not repeat; confirm in league settings.
+      repeating: false
+
+  receiving:
+    reception: 1
+    yards_per_point: 10
+    touchdown: 6
+    two_point_conversion: 2
+    bonus:
+      threshold_yards: 100
+      points: 1
+      repeating: false
+
+  misc:
+    fumble_lost: -2
+    fumble_return_touchdown: 6
+
+# Kicker and team defense rules are recorded here for reference only. They are
+# not used, because those positions are out of scope for the model.
+#
+# kicker:
+#   point_after_made: 1
+#   field_goal_total_yards_per_point: 10
+#   field_goal_missed_0_19: -2
+#   field_goal_missed_20_29: -1
+#
+# defense_special_teams:
+#   sack: 1
+#   interception: 2
+#   fumble_recovery: 2
+#   touchdown: 6
+#   safety: 2
+#   blocked_kick: 2
+#   return_touchdown: 6
+#   extra_point_returned: 2
+#   points_allowed:
+#     "0": 10
+#     "1-6": 8
+#     "7-13": 5
+#     "14-20": 3
+#     "21-27": 2
+#     "28-34": 1
+#     "35+": 0
+
+
+# ----------------------------------------------------------------------------
+# Feature engineering
+#
+# Every rolling statistic must be shifted by one game before use. See the data
+# leakage section of CLAUDE.md.
+# ----------------------------------------------------------------------------
+features:
+  rolling_windows:
+    - 3
+    - 5
+    - 8
+
+  # Player-weeks with fewer than this many prior games are dropped from
+  # training, because their rolling features are mostly empty. Rookies early in
+  # the season are the main group affected.
+  min_prior_games: 3
+
+  # Feature groups. Turn one off to measure how much it contributes.
+  groups:
+    rolling_production: true
+    usage_share: true
+    opportunity: true
+    game_context: true
+    opponent_strength: true
+    player_attributes: true
+
+  # Number of prior weeks used to compute how many points a defense has allowed
+  # to each position. Null means use all completed weeks of the current season.
+  opponent_lookback_weeks: null
+
+
+# ----------------------------------------------------------------------------
+# Validation
+#
+# Splits are always by time. Never shuffle randomly, because that leaks future
+# information into the training set.
+# ----------------------------------------------------------------------------
+validation:
+  # Simple holdout used during early development.
+  train_through_season: 2022
+  validation_season: 2023
+  test_season: 2024
+
+  # Walk-forward validation, the more honest evaluation. Retrains for each
+  # season in the list and tests on that season.
+  walk_forward:
+    enabled: false
+    first_test_season: 2021
+
+
+# ----------------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------------
+model:
+  # Naive predictor that every real model is judged against.
+  baseline:
+    method: rolling_mean
+    window: 3
+
+  type: lightgbm
+
+  # One model is trained per position, so parameters are given per position.
+  # Start with these values and tune later.
+  lightgbm:
+    shared:
+      objective: regression
+      metric: mae
+      learning_rate: 0.05
+      num_leaves: 31
+      min_data_in_leaf: 40
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      num_boost_round: 1000
+      early_stopping_rounds: 50
+      verbosity: -1
+
+    # Per position overrides. QB has far fewer rows than WR, so it needs
+    # simpler trees to avoid overfitting.
+    by_position:
+      QB:
+        num_leaves: 15
+        min_data_in_leaf: 20
+      RB: {}
+      WR: {}
+      TE:
+        num_leaves: 20
+        min_data_in_leaf: 25
+
+  # Quantile models for floor and ceiling projections. Deferred to version two,
+  # but the settings are here so the code can be written to support them.
+  quantiles:
+    enabled: false
+    levels:
+      - 0.1
+      - 0.5
+      - 0.9
+
+
+# ----------------------------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------------------------
+evaluation:
+  metrics:
+    - mae
+    - rmse
+    - spearman_within_position_week
+
+  # Always print the baseline scores next to the model scores. A model that
+  # does not beat the baseline is not working, no matter how good its raw
+  # error looks.
+  always_compare_to_baseline: true
+
+  # Report metrics separately for these groups, so that a model that is strong
+  # overall but weak on starters is not hidden by bench players.
+  breakdowns:
+    - position
+    - season
+
+
+# ----------------------------------------------------------------------------
+# Prediction
+# ----------------------------------------------------------------------------
+predict:
+  # Season and week to project. Null means use nflreadpy.get_current_season()
+  # and get_current_week() at runtime.
+  season: null
+  week: null
+
+  # Only project players who meet these conditions, to keep the output list
+  # readable rather than including every rostered player in the league.
+  min_snap_share_last_3: 0.25
+  output_format: csv
+
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+logging:
+  level: INFO
+  log_row_counts: true

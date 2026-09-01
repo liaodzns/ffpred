@@ -1,0 +1,93 @@
+# ============================================================================
+# Data and model artifacts
+#
+# None of this is committed. Every raw table can be pulled again from the
+# public nflverse repositories, and every processed table and trained model
+# can be rebuilt by rerunning the pipeline. Committing them would add hundreds
+# of megabytes to the repository for no benefit.
+#
+# The .gitkeep exceptions below keep the empty directory structure in version
+# control, so that a fresh clone has the folders the pipeline expects.
+# ============================================================================
+data/
+models/
+!data/**/.gitkeep
+!models/.gitkeep
+
+# nflreadpy writes its own cache outside the project by default, but ignore a
+# local cache directory in case cache_dir is ever pointed inside the repo.
+.nflreadpy_cache/
+*.parquet
+
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+
+# ============================================================================
+# Virtual environments
+# ============================================================================
+.venv/
+venv/
+env/
+ENV/
+
+
+# ============================================================================
+# Tooling caches
+# ============================================================================
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+
+# ============================================================================
+# Notebooks
+#
+# Checkpoints are ignored. The notebooks themselves are committed, but strip
+# their output before committing, since stored output makes diffs unreadable.
+# ============================================================================
+.ipynb_checkpoints/
+
+
+# ============================================================================
+# Editors and IDEs
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+
+# ============================================================================
+# Operating system files
+# ============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ============================================================================
+# Local settings and secrets
+#
+# No API keys are needed for this project, since all nflverse data is public.
+# These entries exist so that nothing personal is committed by accident.
+# ============================================================================
+.env
+.env.local
+.claude/settings.local.json
+claude.md
