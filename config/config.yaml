@@ -17,7 +17,7 @@ project:
 data:
   # Seasons to download from nflreadpy. Set end_season to null to use
   # nflreadpy.get_current_season() at runtime.
-  start_season: 2016
+  start_season: 2022
   end_season: null
 
   # Skill positions modeled. Kickers and team defenses are out of scope.
@@ -183,9 +183,9 @@ features:
 # ----------------------------------------------------------------------------
 validation:
   # Simple holdout used during early development.
-  train_through_season: 2022
-  validation_season: 2023
-  test_season: 2024
+  train_through_season: 2023
+  validation_season: 2024
+  test_season: 2025
 
   # Walk-forward validation, the more honest evaluation. Retrains for each
   # season in the list and tests on that season.
