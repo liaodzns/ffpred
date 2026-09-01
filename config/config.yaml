@@ -191,7 +191,7 @@ validation:
   # season in the list and tests on that season.
   walk_forward:
     enabled: false
-    first_test_season: 2021
+    first_test_season: 2022
 
 
 # ----------------------------------------------------------------------------
