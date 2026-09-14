@@ -178,3 +178,137 @@ def test_requiring_more_agreeing_seeds_than_were_run_is_refused() -> None:
     """Eleven of ten could never be met, so it is a configuration error."""
     with pytest.raises(ValueError, match="only 10 were run"):
         evaluate.seed_averaged_verdict(verdict_input(-0.05, -4.0, 10, 0), 2.0, 11)
+
+
+def test_rmse_comparison_matches_hand_computed_values() -> None:
+    """Reference RMSEs are root 0.5 and 1.0 over the two seeds; the candidate's are 0.0 and 0.5.
+
+    The row term linearises RMSE: each row contributes its seed-averaged squared
+    error over twice its model's seed-averaged RMSE. The reference's averaged
+    squared errors are 0.5, 0.5, 0, 2 and the candidate's 0, 0, 0.5, 0.
+    """
+    comparison = evaluate.seed_averaged_rmse_comparison(ACTUAL, two_seed_reference(), two_seed_candidate())
+
+    rmse_reference = [float(np.sqrt(0.5)), 1.0]
+    rmse_candidate = [0.0, 0.5]
+    first_difference = rmse_candidate[0] - rmse_reference[0]
+    second_difference = rmse_candidate[1] - rmse_reference[1]
+    contributions = np.array([0.0, 0.0, 0.5, 0.0]) / (2.0 * 0.25) - np.array([0.5, 0.5, 0.0, 2.0]) / (
+        2.0 * float(np.mean(rmse_reference))
+    )
+
+    assert comparison["metric_a_by_seed"] == pytest.approx(rmse_reference)
+    assert comparison["metric_b_by_seed"] == pytest.approx(rmse_candidate)
+    assert comparison["delta"] == pytest.approx((first_difference + second_difference) / 2.0)
+    assert comparison["se_unit"] == pytest.approx(float(np.std(contributions, ddof=1)) / 2.0)
+    assert comparison["se_seed"] == pytest.approx(abs(first_difference - second_difference) / 2.0)
+    assert comparison["favourable_seeds"] == 2
+    assert comparison["higher_is_better"] is False
+
+
+def rank_metadata(weeks: list[int]) -> pd.DataFrame:
+    """Build metadata placing every row in one position and season, in the given weeks.
+
+    Takes each row's week. Returns the frame.
+    """
+    positions = []
+    seasons = []
+    for _ in weeks:
+        positions.append("WR")
+        seasons.append(2024)
+    return pd.DataFrame({"position": positions, "season": seasons, "week": weeks})
+
+
+def test_spearman_comparison_averages_groups_and_drops_undefined_ones() -> None:
+    """Two weeks of three players each, and a one-player week with no correlation.
+
+    Reference: seed one ranks week 1 perfectly and week 2 backwards (mean 0),
+    seed two scores 0.5 and 1 (mean 0.75). Candidate: 1 and 1 (mean 1), then 1
+    and 0.5 (mean 0.75). Seed differences are 1 and 0, so the effect is 0.5 on
+    one favourable seed. Averaged over seeds, the week differences are 0.25 and
+    0.75, so the group term is 0.25; the seed term is 0.5.
+    """
+    weeks = [1, 1, 1, 2, 2, 2, 3]
+    actual = pd.Series([1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 5.0])
+    reference = [
+        pd.Series([1.0, 2.0, 3.0, 3.0, 2.0, 1.0, 5.0]),
+        pd.Series([1.0, 3.0, 2.0, 1.0, 2.0, 3.0, 5.0]),
+    ]
+    candidate = [
+        pd.Series([1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 5.0]),
+        pd.Series([1.0, 2.0, 3.0, 2.0, 1.0, 3.0, 5.0]),
+    ]
+
+    comparison = evaluate.seed_averaged_spearman_comparison(actual, reference, candidate, rank_metadata(weeks))
+
+    assert comparison["groups_dropped"] == 1
+    assert comparison["units"] == 2
+    assert comparison["metric_a_by_seed"] == pytest.approx([0.0, 0.75])
+    assert comparison["metric_b_by_seed"] == pytest.approx([1.0, 0.75])
+    assert comparison["delta"] == pytest.approx(0.5)
+    assert comparison["se_unit"] == pytest.approx(0.25)
+    assert comparison["se_seed"] == pytest.approx(0.5)
+    assert comparison["favourable_seeds"] == 1
+    assert comparison["unfavourable_seeds"] == 0
+
+
+def test_a_higher_is_better_metric_is_judged_in_its_own_direction() -> None:
+    """For rank correlation a consistent rise helps and a consistent fall hurts."""
+    rises = {"seeds": 10, "delta": 0.05, "t": 4.0, "favourable_seeds": 10, "unfavourable_seeds": 0,
+             "higher_is_better": True}
+    falls = {"seeds": 10, "delta": -0.05, "t": -4.0, "favourable_seeds": 0, "unfavourable_seeds": 10,
+             "higher_is_better": True}
+
+    assert evaluate.seed_averaged_verdict(rises, 2.0, 8)["verdict"] == evaluate.HELPS
+    assert evaluate.seed_averaged_verdict(falls, 2.0, 8)["verdict"] == evaluate.HURTS
+
+
+def test_group_bias_catches_a_predictor_that_over_projects_low_and_under_projects_high() -> None:
+    """Projections at half the spread of the actual scores, around the same mean.
+
+    Group 1 is projected 10 and scores 5, a bias of +5; group 2 is projected
+    20 and scores 25, a bias of -5. With two identical seeds the seed term is
+    zero, and the row term is the SD of 7.5 and 2.5 over root 2, which is 2.5.
+    """
+    actual = np.array([0.0, 10.0, 20.0, 30.0])
+    projection = np.array([7.5, 12.5, 17.5, 22.5])
+    rows = evaluate.projection_group_bias(actual, [projection, projection], np.array([1, 1, 2, 2]), 2)
+
+    assert rows[0]["rows"] == 2
+    assert rows[0]["mean_projected"] == pytest.approx(10.0)
+    assert rows[0]["mean_actual"] == pytest.approx(5.0)
+    assert rows[0]["bias"] == pytest.approx(5.0)
+    assert rows[0]["se_row"] == pytest.approx(2.5)
+    assert rows[0]["t"] == pytest.approx(2.0)
+    assert rows[0]["seeds_same_sign"] == 2
+    assert rows[1]["bias"] == pytest.approx(-5.0)
+
+
+def test_the_calibration_slope_is_two_for_half_spread_and_one_when_calibrated() -> None:
+    """Actual scores spread twice as wide as these projections, so their slope is 2."""
+    actual = np.array([0.0, 10.0, 20.0, 30.0])
+    compressed = np.array([7.5, 12.5, 17.5, 22.5])
+
+    slope = evaluate.calibration_slope(actual, [compressed, compressed])
+    assert slope["slope"] == pytest.approx(2.0)
+    assert slope["seeds_above_one"] == 2
+    assert slope["overall_bias"] == pytest.approx(0.0)
+
+    calibrated = evaluate.calibration_slope(actual, [actual, actual])
+    assert calibrated["slope"] == pytest.approx(1.0)
+    assert calibrated["seeds_above_one"] == 0
+
+
+def test_compression_is_called_only_when_both_ends_and_the_slope_agree() -> None:
+    """A clear low end and slope are not enough if the high end is not under-projected."""
+    low = {"bias": 1.0, "t": 5.0, "seeds_same_sign": 10}
+    high = {"bias": -1.0, "t": -5.0, "seeds_same_sign": 10}
+    steep = {"slope": 1.2, "t_against_one": 4.0}
+
+    assert evaluate.compression_verdict([low, high], steep, 2.0, 8)["present"] is True
+
+    flat_high = {"bias": -0.1, "t": -1.0, "seeds_same_sign": 10}
+    verdict = evaluate.compression_verdict([low, flat_high], steep, 2.0, 8)
+    assert verdict["present"] is False
+    assert "highest group" in verdict["reason"]
+    assert "lowest group" not in verdict["reason"]

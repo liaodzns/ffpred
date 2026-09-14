@@ -72,6 +72,9 @@ def output_frame(points: list[float], player_ids: list[str]) -> pd.DataFrame:
             "status": predict.PROJECTED,
             "projected_points": points,
             "projection_method": predict.PROJECTOR_MODEL,
+            "floor": float("nan"),
+            "ceiling": float("nan"),
+            "interval_note": "",
         }
     )
 
@@ -273,6 +276,83 @@ def test_a_baseline_that_disagrees_with_the_rolling_feature_is_refused() -> None
     predict.check_baseline_matches_rolling_mean(projections, agreeing, baseline_config(), "QB")
     with pytest.raises(ValueError, match="disagree"):
         predict.check_baseline_matches_rolling_mean(projections, disagreeing, baseline_config(), "QB")
+
+
+def interval_config(position_intervals: dict) -> dict:
+    """Build a config recording which bounds ship, with QB on the baseline.
+
+    Takes the predict.intervals entries. Returns the config.
+    """
+    return {
+        "data": {"positions": ["QB", "RB"]},
+        "predict": {
+            "projectors": {"default": predict.PROJECTOR_MODEL, "by_position": {"QB": predict.PROJECTOR_BASELINE}},
+            "intervals": position_intervals,
+        },
+    }
+
+
+def test_only_the_bounds_the_config_records_as_passing_ship() -> None:
+    """A bound ships only when marked so; a missing entry ships nothing and says why."""
+    config = interval_config(
+        {"RB": {"floor": {"ship": False, "note": "0.1 quantile failed calibration"}, "ceiling": {"ship": True}}}
+    )
+
+    assert predict.shipped_bounds(config, "RB") == ["ceiling"]
+    assert predict.shipped_bounds(config, "QB") == []
+    assert predict.interval_note(config, "RB") == "floor not shipped: 0.1 quantile failed calibration"
+    assert "no calibration result recorded" in predict.interval_note(config, "QB")
+
+
+def test_a_quantile_interval_around_a_baseline_point_says_so() -> None:
+    """The mismatch between the two methods is written on the row, not resolved silently."""
+    config = interval_config({"QB": {"floor": {"ship": True}, "ceiling": {"ship": True}}})
+    assert predict.interval_note(config, "QB") == predict.BASELINE_INTERVAL_NOTE
+
+
+def test_intervals_for_an_unmodelled_position_are_refused() -> None:
+    """A typo in a position name must not quietly ship nothing."""
+    with pytest.raises(ValueError, match="not a modelled position"):
+        predict.shipped_bounds(interval_config({"K": {"ceiling": {"ship": True}}}), "RB")
+
+
+def interval_output(floors: list[float], ceilings: list[float], statuses: list[str]) -> pd.DataFrame:
+    """Build an output table of running backs with floors and ceilings.
+
+    Takes each row's floor, ceiling, and status. Returns the frame.
+    """
+    positions = []
+    for _ in statuses:
+        positions.append("RB")
+    return pd.DataFrame({"position": positions, "status": statuses, "floor": floors, "ceiling": ceilings})
+
+
+def test_interval_checks_refuse_crossed_missing_unshipped_or_implausible_bounds() -> None:
+    """Every way a bound can be wrong raises, rather than reaching the CSV."""
+    both = interval_config({"RB": {"floor": {"ship": True}, "ceiling": {"ship": True}}})
+    lowest = {"RB": -2.0}
+    highest = {"RB": 58.1}
+    projected = [predict.PROJECTED, predict.PROJECTED]
+    nan = float("nan")
+
+    predict.check_intervals(interval_output([2.0, 5.0], [10.0, 20.0], projected), both, lowest, highest)
+
+    with pytest.raises(ValueError, match="above their ceiling"):
+        predict.check_intervals(interval_output([12.0, 5.0], [10.0, 20.0], projected), both, lowest, highest)
+    with pytest.raises(ValueError, match="missing a shipped ceiling"):
+        predict.check_intervals(interval_output([2.0, 5.0], [nan, 20.0], projected), both, lowest, highest)
+    with pytest.raises(ValueError, match="below the position's worst"):
+        predict.check_intervals(interval_output([-3.0, 5.0], [10.0, 20.0], projected), both, lowest, highest)
+    with pytest.raises(ValueError, match="above the position's best"):
+        predict.check_intervals(interval_output([2.0, 5.0], [10.0, 60.0], projected), both, lowest, highest)
+
+    ceiling_only = interval_config({"RB": {"floor": {"ship": False, "note": "failed"}, "ceiling": {"ship": True}}})
+    with pytest.raises(ValueError, match="floor present but not shipped"):
+        predict.check_intervals(interval_output([2.0, 5.0], [10.0, 20.0], projected), ceiling_only, lowest, highest)
+
+    with_excluded = interval_output([2.0, 1.0], [10.0, nan], [predict.PROJECTED, predict.EXCLUDED])
+    with pytest.raises(ValueError, match="excluded"):
+        predict.check_intervals(with_excluded, ceiling_only, lowest, highest)
 
 
 def deployment_groups_config() -> dict:

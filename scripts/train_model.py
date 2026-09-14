@@ -11,8 +11,10 @@ it, which gates whether tuning is worth running. --seed-averaged restates each
 model against its baseline and re-tests the marginal groups over those seeds.
 --quantiles measures the floor and ceiling models' calibration over the same
 seeds and saves their walk-forward models; --deploy-quantiles trains the live
-quantile models for the bounds that passed. Otherwise every position's
-walk-forward model is trained, scored, and saved.
+quantile models for the bounds that passed. --point-diagnostics compares the
+median model with the mean model on MAE, RMSE, and within-week rank
+correlation, and tests the point projections for compression; it saves nothing.
+Otherwise every position's walk-forward model is trained, scored, and saved.
 
 Every mode retrains once per walk-forward test season and pools the scored
 rows, rather than betting a verdict on a single holdout year.
@@ -155,6 +157,14 @@ def parse_arguments() -> argparse.Namespace:
         "--deploy-quantiles",
         action="store_true",
         help="Train the live quantile models for the bounds predict.intervals ships. Mean models are untouched.",
+    )
+    parser.add_argument(
+        "--point-diagnostics",
+        action="store_true",
+        help=(
+            "Compare the median quantile model with the mean model on MAE, RMSE, and within-week Spearman, "
+            "and test the point projections for compression, over every seed in model.tuning. Saves nothing."
+        ),
     )
     return parser.parse_args()
 
@@ -710,6 +720,10 @@ def main() -> int:
 
     if arguments.quantiles:
         run_quantiles(config, positions, player_weeks)
+        return 0
+
+    if arguments.point_diagnostics:
+        run_point_diagnostics(config, positions, player_weeks)
         return 0
 
     run_training(config, positions, player_weeks)
@@ -1456,6 +1470,281 @@ def run_quantile_deployment(config: dict[str, Any], positions: list[str]) -> Non
     else:
         print(pd.DataFrame(table_rows).to_string(index=False))
     print("")
+
+
+
+# The metrics the median is compared with the mean on. MAE favours a median by
+# construction, so the decision also needs RMSE and the within-week rank
+# correlation start/sit decisions actually use.
+POINT_DIAGNOSTIC_METRICS = ["mae", "rmse", "spearman"]
+
+
+def point_diagnostic_sweeps(
+    config: dict[str, Any], position: str, features: pd.DataFrame, seeds: list[int]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Train the mean model and the median quantile model under every seed.
+
+    Takes the parsed config, the position, its feature matrix, and the seeds.
+    Returns both models' per-seed records.
+    """
+    mean_records = tune.seed_sweep(features, position, config, seeds)
+    median_config = quantiles.quantile_config(config, quantiles.MEDIAN_LEVEL)
+    median_records = tune.seed_sweep(features, position, median_config, seeds)
+    return mean_records, median_records
+
+
+def metric_comparison(
+    metric: str,
+    target: pd.Series,
+    reference_projections: list[pd.Series],
+    candidate_projections: list[pd.Series],
+    metadata: pd.DataFrame,
+) -> dict[str, Any]:
+    """Run the seed-averaged comparison for one metric.
+
+    Takes the metric name, the actual scores, the reference and candidate
+    projections per seed, and the metadata. Returns the comparison.
+    """
+    if metric == "rmse":
+        return evaluate.seed_averaged_rmse_comparison(target, reference_projections, candidate_projections)
+    if metric == "spearman":
+        return evaluate.seed_averaged_spearman_comparison(
+            target, reference_projections, candidate_projections, metadata
+        )
+    return evaluate.seed_averaged_comparison(target, reference_projections, candidate_projections)
+
+
+def check_recorded_metric(
+    comparison: dict[str, Any],
+    metric: str,
+    reference_records: list[dict[str, Any]],
+    candidate_records: list[dict[str, Any]],
+) -> None:
+    """Fail unless each seed's RMSE or rank correlation matches what run_evaluation recorded.
+
+    Takes the comparison, the metric, and both models' per-seed records.
+    Returns nothing. Raises ValueError on any difference.
+
+    The rank correlation check is skipped when a group had to be dropped,
+    because run_evaluation drops undefined groups seed by seed instead.
+    """
+    if metric == "mae":
+        return
+    if metric == "spearman" and comparison["groups_dropped"] > 0:
+        return
+
+    pairs = [(comparison["metric_a_by_seed"], reference_records), (comparison["metric_b_by_seed"], candidate_records)]
+    for values, records in pairs:
+        for value, record in zip(values, records, strict=True):
+            if abs(value - record[metric]) > BASELINE_MATCH_TOLERANCE:
+                raise ValueError(
+                    f"Seed {record['seed']}: {metric} {value} differs from the recorded {record[metric]}."
+                )
+
+
+def metric_table_row(
+    position: str,
+    test_name: str,
+    metric: str,
+    comparison: dict[str, Any],
+    verdict: dict[str, str],
+    labels: dict[str, str],
+) -> dict[str, Any]:
+    """Flatten one metric comparison into a table row.
+
+    Takes the position, the test name, the metric, the comparison, its
+    verdict, and the verdict labels. Returns the row.
+
+    The MAE comparison names its fields after MAE; the others use generic names.
+    """
+    prefix = "metric"
+    effect_key = "delta"
+    unit_key = "se_unit"
+    units = comparison.get("units")
+    if metric == "mae":
+        prefix = "mae"
+        effect_key = "delta_mae"
+        unit_key = "se_row"
+        units = comparison["rows"]
+
+    return {
+        "position": position,
+        "test": f"{test_name} ({metric})",
+        "units": units,
+        "reference": comparison[f"{prefix}_a_mean"],
+        "candidate": comparison[f"{prefix}_b_mean"],
+        "difference": comparison[effect_key],
+        "se_unit": comparison[unit_key],
+        "se_seed": comparison["se_seed"],
+        "se": comparison["se"],
+        "t": comparison["t"],
+        "favourable_seeds": comparison["favourable_seeds"],
+        "groups_dropped": comparison.get("groups_dropped", 0),
+        "verdict": labels[verdict["verdict"]],
+        "reason": verdict["reason"],
+    }
+
+
+def median_metric_rows(
+    config: dict[str, Any],
+    position: str,
+    reference: pd.DataFrame,
+    mean_records: list[dict[str, Any]],
+    median_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compare the median with the mean model on every metric, and with the baseline where it ships.
+
+    Takes the parsed config, the position, the scored rows, and both models'
+    per-seed records. Returns one table row per comparison. Nothing is switched.
+    """
+    target = reference[config["scoring"]["target_column"]]
+    metadata = reference[METADATA_COLUMNS]
+    decision_t = config["evaluation"]["decision_t"]
+    min_seeds = config["evaluation"]["min_favourable_seeds"]
+    mean_projections = sweep_projections(mean_records, MODEL_COLUMN, reference, f"{position} mean")
+    median_projections = sweep_projections(median_records, MODEL_COLUMN, reference, f"{position} median")
+
+    baseline_projections = []
+    for _ in median_projections:
+        baseline_projections.append(reference[BASELINE_COLUMN])
+    ships_baseline = predict.projector_for(config, position) == predict.PROJECTOR_BASELINE
+
+    rows = []
+    for metric in POINT_DIAGNOSTIC_METRICS:
+        comparison = metric_comparison(metric, target, mean_projections, median_projections, metadata)
+        check_recorded_metric(comparison, metric, mean_records, median_records)
+        verdict = evaluate.seed_averaged_verdict(comparison, decision_t, min_seeds)
+        rows.append(metric_table_row(position, "median vs mean", metric, comparison, verdict, MEDIAN_VERDICTS))
+        if ships_baseline:
+            comparison = metric_comparison(metric, target, baseline_projections, median_projections, metadata)
+            verdict = evaluate.seed_averaged_verdict(comparison, decision_t, min_seeds)
+            rows.append(
+                metric_table_row(
+                    position, "median vs baseline", metric, comparison, verdict, MEDIAN_VS_BASELINE_VERDICTS
+                )
+            )
+    return rows
+
+
+def compression_rows(
+    config: dict[str, Any],
+    position: str,
+    reference: pd.DataFrame,
+    mean_records: list[dict[str, Any]],
+    median_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Measure projection bias by group and the calibration slope for mean, median, and baseline.
+
+    Takes the parsed config, the position, the scored rows, and both models'
+    per-seed records. Returns the group rows and the slope rows. Diagnostic
+    only: nothing is corrected.
+
+    Each model is grouped by its own seed-averaged projection. The baseline is
+    repeated once per seed, so its seed terms are zero.
+    """
+    actual = reference[config["scoring"]["target_column"]].to_numpy(dtype=float)
+    group_count = config["model"]["quantiles"]["adoption"]["projection_groups"]
+    decision_t = config["evaluation"]["decision_t"]
+    min_seeds = config["evaluation"]["min_favourable_seeds"]
+
+    baseline_arrays = []
+    for _ in mean_records:
+        baseline_arrays.append(reference[BASELINE_COLUMN].to_numpy(dtype=float))
+    models = [
+        ("mean model", series_arrays(sweep_projections(mean_records, MODEL_COLUMN, reference, f"{position} mean"))),
+        ("median model", series_arrays(sweep_projections(median_records, MODEL_COLUMN, reference, f"{position} median"))),
+        ("baseline", baseline_arrays),
+    ]
+
+    group_rows = []
+    slope_rows = []
+    for model_name, projections_by_seed in models:
+        groups = quantiles.projection_groups(evaluate.seed_average(projections_by_seed), group_count)
+        bias_rows = evaluate.projection_group_bias(actual, projections_by_seed, groups, group_count)
+        for bias_row in bias_rows:
+            table_row: dict[str, Any] = {"position": position, "model": model_name}
+            for key in bias_row:
+                table_row[key] = bias_row[key]
+            group_rows.append(table_row)
+
+        slope = evaluate.calibration_slope(actual, projections_by_seed)
+        verdict = evaluate.compression_verdict(bias_rows, slope, decision_t, min_seeds)
+        slope_row: dict[str, Any] = {"position": position, "test": model_name}
+        for key in slope:
+            slope_row[key] = slope[key]
+        slope_row["verdict"] = "not clearly compressed"
+        if verdict["present"]:
+            slope_row["verdict"] = "compressed"
+        slope_row["reason"] = verdict["reason"]
+        slope_rows.append(slope_row)
+    return group_rows, slope_rows
+
+
+def print_point_diagnostics(
+    metric_rows: list[dict[str, Any]],
+    group_rows: list[dict[str, Any]],
+    slope_rows: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> None:
+    """Print the median comparisons and the compression diagnostic.
+
+    Takes the metric rows, the group bias rows, the slope rows, and the parsed
+    config. Returns nothing.
+    """
+    seed_count = len(config["model"]["tuning"]["noise_floor_seeds"])
+    print_seed_averaged_table(
+        f"Median against point estimates on MAE, RMSE, and within-week Spearman: {seed_count} seeds; "
+        "reported only, no projector changes",
+        pd.DataFrame(metric_rows),
+        [
+            "  difference is candidate (median) minus reference; lower is better for MAE and RMSE, "
+            "higher for Spearman.",
+            "  favourable_seeds counts seeds where the median did better on that metric.",
+            "  units are rows for MAE and RMSE, and position-week groups for Spearman.",
+        ],
+    )
+    print_plain_table(
+        "Compression: mean projected against mean actual in five groups by each model's own projection "
+        "(group 1 lowest); bias is projected minus actual",
+        group_rows,
+    )
+    print_seed_averaged_table(
+        "Calibration slope of actual on projection: 1 is calibrated, above 1 is compressed. Diagnostic only",
+        pd.DataFrame(slope_rows),
+        [
+            "  compressed only if the lowest group is over-projected and the highest under-projected, each beyond "
+            "2 seed-aware SEs in at least 8 of 10 seeds, and the slope is above 1 beyond 2 SEs.",
+        ],
+    )
+
+
+def run_point_diagnostics(config: dict[str, Any], positions: list[str], player_weeks: pd.DataFrame) -> None:
+    """Compare the median with the mean on every metric and test the point projections for compression.
+
+    Takes the parsed config, the positions, and the player-week frame carrying
+    the baseline. Returns nothing.
+
+    Nothing is saved, switched, corrected, or tuned. Every figure comes from
+    the pooled walk-forward folds; the sealed season is never scored.
+    """
+    seeds = config["model"]["tuning"]["noise_floor_seeds"]
+    metric_rows = []
+    group_rows = []
+    slope_rows = []
+    for position in positions:
+        features = load_position_features(config, position, player_weeks)
+        mean_records, median_records = point_diagnostic_sweeps(config, position, features, seeds)
+        reference = mean_records[0]["scored"]
+
+        for row in median_metric_rows(config, position, reference, mean_records, median_records):
+            metric_rows.append(row)
+        position_groups, position_slopes = compression_rows(config, position, reference, mean_records, median_records)
+        for row in position_groups:
+            group_rows.append(row)
+        for row in position_slopes:
+            slope_rows.append(row)
+
+    print_point_diagnostics(metric_rows, group_rows, slope_rows, config)
 
 
 if __name__ == "__main__":
