@@ -336,7 +336,12 @@ model:
   type: lightgbm
 
   # One model is trained per position, so parameters are given per position.
-  # Start with these values and tune later.
+  #
+  # These values were never tuned, on purpose. Stage nine measured the seed
+  # noise floor first, and at every position seed luck alone moved pooled MAE
+  # by as much as the effects a search would be looking for, so no position was
+  # searched. See model.tuning below and the per-position notes under
+  # by_position.
   lightgbm:
     shared:
       objective: regression
@@ -353,15 +358,49 @@ model:
 
     # Per position overrides. QB has far fewer rows than WR, so it needs
     # simpler trees to avoid overfitting.
+    #
+    # Stage nine outcome, per position: NOT TUNED, parameters unchanged. Each
+    # figure is from ten seeds on the walk-forward folds, pooled MAE, compared
+    # with the 0.02 to 0.04 MAE effects this project has been chasing.
     by_position:
+      # QB: seed range 0.157, SD 0.049, worst versus best seed t = 3.91. Four to
+      # eight times the effects a search would look for, so not searched. Seed
+      # 42, the shipped seed, was QB's best of ten, so its shipped MAE of 6.7774
+      # is optimistic; the ten-seed mean is 6.8577.
       QB:
         num_leaves: 15
         min_data_in_leaf: 20
+      # RB: seed range 0.049, SD 0.015, worst versus best seed t = 2.76. Above
+      # the whole effect band, so not searched.
       RB: {}
+      # WR: seed range 0.036, SD 0.013, worst versus best seed t = 2.86. At the
+      # top of the effect band, so not searched.
       WR: {}
+      # TE: seed range 0.037, SD 0.013, worst versus best seed t = 2.69. At the
+      # top of the effect band, so not searched.
       TE:
         num_leaves: 20
         min_data_in_leaf: 25
+
+  # Hyperparameter tuning, and the measurement that gates it.
+  #
+  # Before any search, each position's walk-forward model is retrained under
+  # every seed below with nothing else changed. The best-to-worst range of
+  # pooled MAE is the noise floor. An effect smaller than it cannot be told
+  # apart from a lucky seed, however large its paired t, because the paired
+  # standard error counts row sampling but not training randomness.
+  #
+  # A position is searched only if its range is below the smallest effect a
+  # search would be looking for, the lower end of effect_band. In stage nine no
+  # position cleared that, so nothing was searched. Rerun the measurement with
+  # scripts/train_model.py --noise-floor.
+  #
+  # If a search is ever run, the pre-registered adoption rule is that the
+  # improvement over current parameters, averaged across these seeds, must
+  # exceed two paired standard errors AND this range. Both, not either.
+  tuning:
+    noise_floor_seeds: [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    effect_band: [0.02, 0.04]
 
   # Quantile models for floor and ceiling projections. Deferred to version two,
   # but the settings are here so the code can be written to support them.

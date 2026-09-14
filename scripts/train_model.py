@@ -99,6 +99,14 @@ def parse_arguments() -> argparse.Namespace:
             "separately and never touch the walk-forward evaluation models."
         ),
     )
+    parser.add_argument(
+        "--noise-floor",
+        action="store_true",
+        help=(
+            "Retrain each walk-forward model under every seed in model.tuning and report "
+            "how far seed luck alone moves it. Saves nothing."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -630,6 +638,10 @@ def main() -> int:
         run_deployment(config, positions)
         return 0
 
+    if arguments.noise_floor:
+        run_noise_floor(config, positions)
+        return 0
+
     player_weeks = load_player_weeks_with_baseline(config)
     if arguments.feature_study:
         run_feature_study(config, positions, player_weeks)
@@ -680,6 +692,82 @@ def run_deployment(config: dict[str, Any], positions: list[str]) -> None:
     print(f"  disabled for deployment: {config['predict']['deployment']['disabled_groups']}")
     print(pd.DataFrame(table_rows).to_string(index=False))
     print("")
+
+
+def _noise_floor_row(
+    summary: dict[str, Any], baseline_mae: float, verdict: dict[str, str]
+) -> dict[str, Any]:
+    """Flatten one position's noise floor summary into a table row.
+
+    Takes the summary, the baseline MAE on the same rows, and the gate verdict.
+    Returns the row.
+    """
+    return {
+        "position": summary["position"],
+        "rows": summary["scored_rows"],
+        "mae_mean": round(summary["mae_mean"], 4),
+        "mae_sd": round(summary["mae_sd"], 4),
+        "mae_best": round(summary["mae_best"], 4),
+        "mae_worst": round(summary["mae_worst"], 4),
+        "mae_range": round(summary["mae_range"], 4),
+        "rmse_sd": round(summary["rmse_sd"], 4),
+        "spearman_sd": round(summary["spearman_sd"], 4),
+        "worst_vs_best_t": round(summary["worst_vs_best_t"], 2),
+        "shipped_seed_rank": f"{summary['reference_rank']} of {len(summary['seeds'])}",
+        "baseline_mae": round(baseline_mae, 4),
+        "mean_gain_vs_baseline": round(baseline_mae - summary["mae_mean"], 4),
+        "verdict": verdict["verdict"],
+    }
+
+
+def run_noise_floor(config: dict[str, Any], positions: list[str]) -> None:
+    """Measure and print how far each position's model moves when only the seed changes.
+
+    Takes the parsed config and the positions. Returns nothing.
+
+    Nothing is saved and no model is replaced. Each walk-forward model is
+    retrained under every seed in model.tuning.noise_floor_seeds, and the spread
+    decides, through the gate, whether tuning that position could be measured.
+    """
+    tuning_config = config["model"]["tuning"]
+    seeds = tuning_config["noise_floor_seeds"]
+    target_column = config["scoring"]["target_column"]
+    shipped_seed = config["project"]["random_seed"]
+    player_weeks = load_player_weeks_with_baseline(config)
+
+    table_rows = []
+    reasons = []
+    per_seed_lines = []
+    for position in positions:
+        features = load_position_features(config, position, player_weeks)
+        records = tune.seed_sweep(features, position, config, seeds)
+        summary = tune.summarize_noise_floor(records, target_column, shipped_seed)
+        summary["position"] = position
+        verdict = tune.gate_verdict(summary, tuning_config["effect_band"])
+
+        baseline_results = score_predictions(records[0]["scored"], BASELINE_COLUMN, config)
+        table_rows.append(_noise_floor_row(summary, baseline_results["overall"]["mae"], verdict))
+        reasons.append(f"  {position}: {verdict['verdict'].upper()}: {verdict['reason']}")
+
+        seed_maes = []
+        for seed, mae in zip(summary["seeds"], summary["maes"], strict=True):
+            seed_maes.append(f"{seed}:{mae:.4f}")
+        per_seed_lines.append(f"  {position}: " + ", ".join(seed_maes))
+
+    print("")
+    print(f"Seed noise floor: {len(seeds)} seeds, pooled walk-forward MAE, nothing saved")
+    print("=" * 100)
+    print(pd.DataFrame(table_rows).to_string(index=False))
+    print("")
+    print(f"Gate (effect band {tuning_config['effect_band']}):")
+    for reason in reasons:
+        print(reason)
+    print("")
+    print("Per-seed pooled MAE:")
+    for line in per_seed_lines:
+        print(line)
+    print("")
+
 
 if __name__ == "__main__":
     sys.exit(main())
