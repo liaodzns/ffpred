@@ -14,6 +14,7 @@ from ffml.features.build_dataset import build_feature_matrix, feature_column_nam
 from ffml.features.opponent import OPPONENT_STRENGTH_FEATURE, add_opponent_strength
 from ffml.features.rolling import GAMES_PLAYED_COLUMN
 from ffml.models.baseline import predict_baseline
+from ffml.models.predict import build_upcoming_rows, upcoming_feature_rows
 
 TARGET = "fantasy_points_league"
 WINDOW = 3
@@ -589,3 +590,112 @@ def test_kickoff_times_are_read_as_eastern_time() -> None:
 
     chosen = select_pre_kickoff_reports(just_before, kickoff_times(synthetic_schedule()))
     assert len(chosen) == 1
+
+
+# ---------------------------------------------------------------------------
+# The upcoming-week row: a projection must see nothing of the week it projects
+#
+# A live projection is built for a game with no box score yet, but the same
+# code runs for a completed week, where the answer is sitting in the table.
+# These tests put it there on purpose and require that it changes nothing.
+# ---------------------------------------------------------------------------
+
+UPCOMING_SEASON = 2024
+UPCOMING_WEEK = 5
+
+
+def upcoming_players() -> pd.DataFrame:
+    """Build the one player the upcoming-week tests project.
+
+    Takes nothing. Returns the player frame.
+    """
+    return pd.DataFrame(
+        {
+            "player_id": ["clean_player"],
+            "player_display_name": ["x"],
+            "position": ["WR"],
+            "team": ["x"],
+        }
+    )
+
+
+def upcoming_sides() -> pd.DataFrame:
+    """Build the one game the upcoming-week tests project.
+
+    Takes nothing. Returns the game sides.
+    """
+    return pd.DataFrame({"team": ["x"], "opponent_team": ["x"], "game_id": ["upcoming"]})
+
+
+def project_upcoming(frame: pd.DataFrame) -> tuple[pd.Series, list[str]]:
+    """Build clean_player's week 5 upcoming row from a player-week frame.
+
+    Takes the frame. Returns the row's features and the feature names.
+    """
+    upcoming = build_upcoming_rows(
+        frame, upcoming_players(), upcoming_sides(), UPCOMING_SEASON, UPCOMING_WEEK
+    )
+    rows, feature_names = upcoming_feature_rows(
+        frame, upcoming, feature_config(), "WR", UPCOMING_SEASON, UPCOMING_WEEK
+    )
+    assert len(rows) == 1
+    return rows.iloc[0], feature_names
+
+
+def same_value(left: object, right: object) -> bool:
+    """Compare two feature values, treating two missing values as equal.
+
+    Takes the two values. Returns whether they match.
+    """
+    if pd.isna(left) and pd.isna(right):
+        return True
+    return bool(left == right)
+
+
+def test_an_upcoming_row_equals_the_row_its_completed_game_had() -> None:
+    """Building week 5 as if unplayed gives exactly the features week 5 had once played.
+
+    If the upcoming path computed anything differently from the historical one,
+    the model would be projecting from inputs unlike any it was trained on.
+    """
+    frame = synthetic_feature_input("WR")
+    upcoming_row, feature_names = project_upcoming(frame)
+
+    matrix, _ = build_feature_matrix(frame, feature_config(), "WR")
+    is_played = (matrix["player_id"] == "clean_player") & (matrix["week"] == UPCOMING_WEEK)
+    played_row = matrix[is_played].iloc[0]
+
+    for feature_name in feature_names:
+        assert same_value(upcoming_row[feature_name], played_row[feature_name]), feature_name
+
+    # Targets in weeks 2, 3, 4 are 2, 3, 4. Had week 5 leaked in, the window
+    # would be weeks 3, 4, 5 and read 4.0.
+    assert upcoming_row["targets_roll3"] == 3.0
+    assert upcoming_row[GAMES_PLAYED_COLUMN] == 4
+
+
+def test_the_projected_week_cannot_reach_its_own_upcoming_row() -> None:
+    """Changing, deleting, or adding results at or after week 5 must change nothing.
+
+    This is the property that matters when a projection is run for a week whose
+    games are already in the data, as the smoke test is: the real result is
+    right there, and it must not reach the row built to predict it.
+    """
+    frame = synthetic_feature_input("WR")
+    reference_row, feature_names = project_upcoming(frame)
+    is_projected_week = (frame["player_id"] == "clean_player") & (frame["week"] == UPCOMING_WEEK)
+
+    mutated = frame.copy()
+    for column_name in FEATURE_SOURCE_COLUMNS + [TARGET]:
+        mutated.loc[is_projected_week, column_name] = -1000.0
+
+    deleted = frame[~is_projected_week]
+
+    future_game = frame[is_projected_week].copy()
+    future_game["week"] = UPCOMING_WEEK + 1
+    with_future_game = pd.concat([frame, future_game], ignore_index=True)
+
+    for variant in [mutated, deleted, with_future_game]:
+        variant_row, _ = project_upcoming(variant)
+        for feature_name in feature_names:
+            assert same_value(variant_row[feature_name], reference_row[feature_name]), feature_name

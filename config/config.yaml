@@ -423,6 +423,40 @@ predict:
   min_snap_share_last_3: 0.25
   output_format: csv
 
+  # Injury report statuses that exclude a player from projection. The models
+  # have effectively never seen these, because a player ruled out does not play
+  # and so has no box score row to train on. In 2022-2024, 0 of 912 skill
+  # players listed Out played, and 1 of 171 listed Doubtful did. Questionable
+  # players played 57% of the time and are projected, with a flag.
+  #
+  # This reads the report whether or not it carries a timestamp. It is a filter
+  # on who gets projected, not a model input, so it cannot leak into a feature.
+  excluded_report_statuses:
+    - Out
+    - Doubtful
+
+  # Deployment models, trained for live projections on all completed data.
+  # These are separate from the walk-forward evaluation models, which are saved
+  # directly under data.paths.models and are never overwritten by deployment.
+  deployment:
+    # The most recent completed weeks held out to choose the number of boosting
+    # rounds. Five matches the walk-forward folds' weeks 14 to 18 tail, so the
+    # stopping decision is made on a comparably sized set. Once the round count
+    # is chosen, the model is refit on every completed week at that count,
+    # because the most recent weeks say the most about next week's game.
+    early_stopping_weeks: 5
+
+    # Groups switched off for deployment only. Injuries are off because nflverse
+    # publishes no date_modified for any 2025 or 2026 report, so the pre-kickoff
+    # timestamp rule admits none of them and every row would read not_listed.
+    # Its only measured effect was marginal for TE. Remove it from this list if
+    # the timestamps return.
+    disabled_groups:
+      - injuries
+
+    # Directory under data.paths.models the deployment models are saved to.
+    model_subdirectory: deployment
+
 
 # ----------------------------------------------------------------------------
 # Logging

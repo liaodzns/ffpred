@@ -1,10 +1,14 @@
 """Train one model per position and score each against its naive baseline.
 
-Three modes. --baseline-only scores the naive last-N-game average and trains
+Five modes. --baseline-only scores the naive last-N-game average and trains
 nothing. --feature-study runs the pre-registered test inventory: every model
 against its baseline, and each listed feature group flipped once against its
 position's shipped configuration, with a multiple-comparisons report across the
-whole family. Otherwise every position's model is trained, scored, and saved.
+whole family. --deploy trains the live models on every completed week, saved
+apart from the evaluation models and never scored. --noise-floor retrains each
+walk-forward model under several seeds to measure how far seed luck alone moves
+it, which gates whether tuning is worth running. Otherwise every position's
+walk-forward model is trained, scored, and saved.
 
 Every mode retrains once per walk-forward test season and pools the scored
 rows, rather than betting a verdict on a single holdout year.
@@ -24,7 +28,7 @@ import pandas as pd
 from ffml.config import ConfigError, load_config
 from ffml.features import build_dataset
 from ffml.features.rolling import rolling_feature_name
-from ffml.models import baseline, evaluate, train
+from ffml.models import baseline, evaluate, train, tune
 from ffml.utils.io import read_parquet, resolve_path
 
 # Columns the evaluation groups by when breaking results out.
@@ -86,6 +90,14 @@ def parse_arguments() -> argparse.Namespace:
         "--feature-study",
         action="store_true",
         help="Run the pre-registered feature group tests with multiple-comparison correction.",
+    )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help=(
+            "Train the live deployment models on every completed week. They are saved "
+            "separately and never touch the walk-forward evaluation models."
+        ),
     )
     return parser.parse_args()
 
@@ -177,41 +189,18 @@ def check_baseline_matches_feature(frame: pd.DataFrame, config: dict[str, Any]) 
         )
 
 
-def folds_for(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """List the folds to train, honoring the walk-forward toggle.
-
-    Takes the parsed config. Returns one fold per test season when walk-forward
-    is enabled, otherwise the single holdout fold.
-    """
-    if config["validation"]["walk_forward"]["enabled"]:
-        return train.walk_forward_folds(config)
-    return [train.single_holdout_fold(config)]
-
-
 def score_folds(
     features: pd.DataFrame, position: str, config: dict[str, Any]
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """Train one model per fold and gather every scored row.
 
     Takes the feature matrix, the position, and the parsed config. Returns the
-    pooled scored rows carrying both projections and a fold label, plus the
-    per-fold training results.
+    pooled scored rows and the per-fold training results.
 
-    Each fold is fitted from scratch, so no fold's model carries what an earlier
-    one learned about seasons it was not supposed to have seen.
+    The fold loop lives in train.score_walk_forward, which the noise floor
+    measurement shares, so both report numbers from the same code.
     """
-    scored_parts = []
-    results = []
-
-    for fold in folds_for(config):
-        result = train.train_model(features, position, config, fold)
-        scored = result["validation_rows"].copy()
-        scored[MODEL_COLUMN] = train.predict(result, result["validation_rows"])
-        scored["fold"] = fold["name"]
-        scored_parts.append(scored)
-        results.append(result)
-
-    return pd.concat(scored_parts, ignore_index=True), results
+    return train.score_walk_forward(features, position, config)
 
 
 def score_predictions(
@@ -637,6 +626,10 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return 1
 
+    if arguments.deploy:
+        run_deployment(config, positions)
+        return 0
+
     player_weeks = load_player_weeks_with_baseline(config)
     if arguments.feature_study:
         run_feature_study(config, positions, player_weeks)
@@ -645,6 +638,48 @@ def main() -> int:
     run_training(config, positions, player_weeks)
     return 0
 
+
+def run_deployment(config: dict[str, Any], positions: list[str]) -> None:
+    """Train, save, and summarise the live deployment model for each position.
+
+    Takes the parsed config and the positions. Returns nothing.
+
+    No accuracy figure is printed, deliberately. These models train and early
+    stop on the sealed test season, so any score read off them would be an
+    evaluation on data the project has promised not to evaluate on yet.
+    """
+    raw_directory = resolve_path(config["data"]["paths"]["raw"])
+    processed_directory = resolve_path(config["data"]["paths"]["processed"])
+    schedules = read_parquet(raw_directory / "schedules.parquet")
+    player_weeks = read_parquet(processed_directory / "player_weeks.parquet")
+    completed = train.completed_weeks(schedules, player_weeks, config)
+
+    table_rows = []
+    for position in positions:
+        features = read_parquet(build_dataset.feature_file_path(config, position))
+        result = train.train_deployment_model(features, position, config, completed)
+        model_path, _ = train.save_deployment_model(result, config)
+        stop_weeks = result["early_stopping_weeks"]
+        table_rows.append(
+            {
+                "position": position,
+                "features": len(result["feature_names"]),
+                "train_rows": len(result["train_rows"]),
+                "stop_rows": len(result["stop_rows"]),
+                "refit_rows": len(result["refit_rows"]),
+                "rounds": result["rounds"],
+                "stop_weeks": f"{stop_weeks[0]} to {stop_weeks[-1]}",
+                "saved": str(model_path.relative_to(resolve_path(config["data"]["paths"]["models"]))),
+            }
+        )
+
+    print("")
+    print("Deployment models (live projection only; no accuracy is computed from these)")
+    print("=" * 100)
+    print(f"  completed weeks used: {len(completed)}, {completed[0]} through {completed[-1]}")
+    print(f"  disabled for deployment: {config['predict']['deployment']['disabled_groups']}")
+    print(pd.DataFrame(table_rows).to_string(index=False))
+    print("")
 
 if __name__ == "__main__":
     sys.exit(main())

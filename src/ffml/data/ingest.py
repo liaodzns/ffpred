@@ -74,6 +74,20 @@ def resolve_seasons(config: dict[str, Any]) -> list[int]:
     return seasons
 
 
+def current_season_and_week() -> tuple[int, int]:
+    """Ask nflreadpy which season and week are current.
+
+    Takes nothing. Returns the season and the week.
+
+    This lives here because ingest.py is the only module allowed to import
+    nflreadpy, so the prediction script asks through this function rather than
+    calling the library itself.
+    """
+    season = int(nflreadpy.get_current_season())
+    week = int(nflreadpy.get_current_week())
+    return season, week
+
+
 def enabled_tables(config: dict[str, Any]) -> list[str]:
     """List the tables whose config toggle is set to true.
 

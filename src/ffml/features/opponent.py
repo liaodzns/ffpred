@@ -50,7 +50,14 @@ def defense_points_allowed(player_weeks: pd.DataFrame, target_column: str) -> pd
     looks different under full PPR than under standard scoring, and it is this
     league's view of the matchup that matters.
     """
-    weekly_totals = player_weeks.groupby(DEFENSE_WEEK_KEYS, observed=True)[target_column].sum()
+    # min_count=1 makes a defense-week with no scored rows NaN rather than 0.
+    # That only happens for a week being projected, whose games have not been
+    # played: summing its empty results to zero would record a shutout that
+    # never happened. Every completed game has a score, so historical totals
+    # are unchanged.
+    weekly_totals = player_weeks.groupby(DEFENSE_WEEK_KEYS, observed=True)[target_column].sum(
+        min_count=1
+    )
     allowed = weekly_totals.reset_index()
     allowed = allowed.rename(columns={target_column: POINTS_ALLOWED_COLUMN})
 
