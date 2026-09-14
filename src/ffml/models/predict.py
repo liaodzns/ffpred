@@ -35,14 +35,26 @@ from ffml.data.clean import (
 from ffml.features.build_dataset import build_feature_matrix, resolve_groups
 from ffml.features.game_context import home_away
 from ffml.features.opponent import OPPONENT_STRENGTH_FEATURE
-from ffml.features.rolling import GAMES_PLAYED_COLUMN, SORT_COLUMNS
-from ffml.models import train
+from ffml.features.rolling import GAMES_PLAYED_COLUMN, SORT_COLUMNS, rolling_feature_name
+from ffml.models import baseline, train
 from ffml.utils.io import ensure_directory, read_parquet, resolve_path
 
 logger = logging.getLogger(__name__)
 
 PROJECTED = "projected"
 EXCLUDED = "excluded"
+
+# How a position's projections are produced, chosen per position in predict.projectors.
+# The model is the deployment LightGBM booster. The baseline is the naive mean of the
+# player's last three games, shipped for a position whose model has not been shown to
+# beat it. Every projected row records which one produced its number.
+PROJECTOR_MODEL = "model"
+PROJECTOR_BASELINE = "baseline"
+PROJECTORS = [PROJECTOR_MODEL, PROJECTOR_BASELINE]
+
+# The baseline projection and the feature builder's three game rolling mean of the
+# target are computed by separate code paths that must agree exactly.
+BASELINE_MATCH_TOLERANCE = 1e-9
 
 # Exclusion reasons. Each player gets the first that applies, in the order they
 # are listed in exclusion_reasons.
@@ -79,6 +91,7 @@ OUTPUT_COLUMNS = [
     "status",
     "exclusion_reason",
     "projected_points",
+    "projection_method",
     "injury_report_status",
     "flag_team_changed",
     "flag_early_season",
@@ -639,20 +652,159 @@ def load_prediction_tables(config: dict[str, Any]) -> dict[str, pd.DataFrame]:
     }
 
 
-def project_position(
-    context: dict[str, Any], candidates: pd.DataFrame, position: str
-) -> tuple[pd.DataFrame | None, list[str]]:
-    """Project every eligible player at one position.
+def projector_for(config: dict[str, Any], position: str) -> str:
+    """Decide how one position's projections are produced.
 
-    Takes the run context, the candidates, and the position. Returns the
-    projected points per player, or None if nobody is eligible, and the
-    features that were empty by design.
+    Takes the parsed config and the position. Returns model or baseline: the
+    position's override in predict.projectors when it has one, otherwise the
+    default, and model when the block is absent. Raises ValueError for an
+    unknown method or an override naming a position that is not modelled.
+
+    This is a deployment choice made per position in the config, so no position
+    is ever special-cased in code.
     """
-    config = context["config"]
-    booster, metadata = train.load_deployment_model(config, position)
+    projector_config = config["predict"].get("projectors") or {}
+    overrides = projector_config.get("by_position") or {}
+    for override_position in overrides:
+        if override_position not in config["data"]["positions"]:
+            raise ValueError(
+                f"predict.projectors.by_position names {override_position}, which is not a "
+                "modelled position."
+            )
+
+    projector = projector_config.get("default", PROJECTOR_MODEL)
+    if position in overrides:
+        projector = overrides[position]
+    if projector not in PROJECTORS:
+        raise ValueError(f"Unknown projector '{projector}' for {position}. Use one of {PROJECTORS}.")
+    return projector
+
+
+def projection_methods(config: dict[str, Any]) -> dict[str, str]:
+    """List the projection method of every modelled position.
+
+    Takes the parsed config. Returns the method per position.
+    """
+    methods = {}
+    for position in config["data"]["positions"]:
+        methods[position] = projector_for(config, position)
+    return methods
+
+
+def load_current_model(context: dict[str, Any], position: str) -> tuple[Any, dict[str, Any]]:
+    """Load one position's deployment model, refusing a stale one.
+
+    Takes the run context and the position. Returns the booster and its
+    metadata. Raises ValueError through check_model_is_current.
+    """
+    booster, metadata = train.load_deployment_model(context["config"], position)
     check_model_is_current(
         metadata, position, context["history"]["latest_completed"], context["target"], context["smoke_test"]
     )
+    return booster, metadata
+
+
+def baseline_projections(
+    player_weeks: pd.DataFrame, upcoming: pd.DataFrame, config: dict[str, Any], season: int, week: int
+) -> pd.Series:
+    """Project upcoming rows with the naive baseline.
+
+    Takes the player-week table, the upcoming rows, the parsed config, and the
+    target season and week. Returns the projection per player id. Raises
+    ValueError if any upcoming row has no projection.
+
+    History is cut strictly before the target week, exactly as for the feature
+    builder, and the baseline is the same function that scored the walk-forward
+    folds. The upcoming rows carry no result, so they only mark where the next
+    game falls; the three game mean looks back from there.
+    """
+    history = history_before(player_weeks, season, week)
+    combined = pd.concat([history, upcoming], ignore_index=True)
+    projected = baseline.run_baseline(combined, config)
+
+    is_target = (combined["season"] == season) & (combined["week"] == week)
+    projections = pd.Series(
+        projected[is_target].to_numpy(), index=combined.loc[is_target, "player_id"].to_numpy()
+    )
+
+    missing = projections[projections.isna()]
+    if len(missing) > 0:
+        raise ValueError(
+            f"{len(missing)} upcoming rows have no baseline projection, although every projected "
+            f"player should have enough history: {sorted(missing.index.tolist())}."
+        )
+    return projections
+
+
+def check_baseline_matches_rolling_mean(
+    projections: pd.Series, rows: pd.DataFrame, config: dict[str, Any], position: str
+) -> None:
+    """Fail unless the baseline projection equals the builder's rolling mean of the target.
+
+    Takes the baseline projection per player id, the upcoming feature rows, the
+    parsed config, and the position. Returns nothing. Raises ValueError if the
+    rolling mean is not built or the two disagree for any player.
+
+    Training cross-checks the same agreement on every run. A disagreement here
+    means the projected number is not the baseline the evaluation measured.
+    """
+    feature_name = rolling_feature_name(
+        config["scoring"]["target_column"], config["model"]["baseline"]["window"]
+    )
+    if feature_name not in rows.columns:
+        raise ValueError(f"{position}: {feature_name} is not built, so the baseline cannot be cross-checked.")
+
+    built = rows.set_index("player_id")[feature_name]
+    difference = (projections.reindex(built.index) - built).abs()
+    if difference.isna().any() or float(difference.max()) > BASELINE_MATCH_TOLERANCE:
+        raise ValueError(
+            f"{position}: the baseline projection and {feature_name} disagree, by up to "
+            f"{difference.max()}. They must be the same number."
+        )
+
+
+def check_projection_methods(output: pd.DataFrame, config: dict[str, Any]) -> None:
+    """Fail unless every projected row names the method its position ships.
+
+    Takes the output table and the parsed config. Returns nothing. Raises
+    ValueError if a projected row's method is missing or differs from
+    predict.projectors.
+
+    A row whose number could have come from either method would make any
+    comparison between players at different positions impossible to read.
+    """
+    projected = output[output["status"] == PROJECTED]
+    problems = []
+    for position in sorted(projected["position"].unique().tolist()):
+        expected = projector_for(config, position)
+        methods = projected.loc[projected["position"] == position, "projection_method"]
+        wrong = methods.isna() | (methods != expected)
+        if wrong.any():
+            problems.append(f"{position}: {int(wrong.sum())} rows not labelled {expected}")
+
+    if len(problems) > 0:
+        raise ValueError("Projection methods disagree with predict.projectors: " + "; ".join(problems))
+
+
+def project_position(
+    context: dict[str, Any], candidates: pd.DataFrame, position: str
+) -> tuple[pd.DataFrame | None, list[str]]:
+    """Project every eligible player at one position, by the method it ships.
+
+    Takes the run context, the candidates, and the position. Returns the
+    projected points and projection method per player, or None if nobody is
+    eligible, and the features that were empty by design.
+
+    Features are built for a baseline position too. They give the games played
+    that the early season flag reads and the rolling mean the baseline is
+    checked against, and they keep the data checks the same for every position.
+    No deployment model is loaded for a baseline position.
+    """
+    config = context["config"]
+    projector = projector_for(config, position)
+    loaded_model = None
+    if projector == PROJECTOR_MODEL:
+        loaded_model = load_current_model(context, position)
 
     is_eligible = (candidates["position"] == position) & candidates["exclusion_reason"].isna()
     eligible = candidates[is_eligible]
@@ -667,11 +819,19 @@ def project_position(
     rows, feature_names = upcoming_feature_rows(
         player_weeks, upcoming, context["deployment_config"], position, season, week
     )
-    check_feature_list(metadata, booster, feature_names, position)
-    expected_empty = check_upcoming_features(rows, feature_names, position, week)
 
-    rows["projected_points"] = booster.predict(rows[feature_names])
-    return rows[["player_id", "projected_points", GAMES_PLAYED_COLUMN]], expected_empty
+    if loaded_model is None:
+        projections = baseline_projections(player_weeks, upcoming, config, season, week)
+        check_baseline_matches_rolling_mean(projections, rows, config, position)
+        rows["projected_points"] = rows["player_id"].map(projections)
+    else:
+        booster, metadata = loaded_model
+        check_feature_list(metadata, booster, feature_names, position)
+        rows["projected_points"] = booster.predict(rows[feature_names])
+
+    expected_empty = check_upcoming_features(rows, feature_names, position, week)
+    rows["projection_method"] = projector
+    return rows[["player_id", "projected_points", "projection_method", GAMES_PLAYED_COLUMN]], expected_empty
 
 
 def injury_display_status(frame: pd.DataFrame) -> pd.Series:
@@ -801,9 +961,11 @@ def sanity_check(output: pd.DataFrame, ceilings: dict[str, float]) -> pd.DataFra
                 f"{position}: projection {points.max():.2f} above the position's best actual "
                 f"game in training, {ceilings[position]:.1f}."
             )
+        methods = projected[projected["position"] == position]["projection_method"]
         rows.append(
             {
                 "position": position,
+                "method": ", ".join(sorted(methods.dropna().unique().tolist())),
                 "projected": len(points),
                 "min": round(float(points.min()), 2),
                 "median": round(float(points.median()), 2),
@@ -973,6 +1135,7 @@ def run_prediction(
 
     output = assemble_output(context, candidates, pd.concat(projection_parts, ignore_index=True))
     distribution = sanity_check(output, position_ceilings(history, config))
+    check_projection_methods(output, config)
 
     return {
         "output": output,
@@ -984,18 +1147,23 @@ def run_prediction(
         "roster_week": roster_week,
         "history": context["history"],
         "expected_empty": expected_empty,
+        "projection_methods": projection_methods(config),
         "trained_through": _trained_through(config),
         "path": write_projections(output, config, season, week, smoke_test),
     }
 
 
 def _trained_through(config: dict[str, Any]) -> dict[str, Any]:
-    """Read which week each deployment model was trained through.
+    """Read which week each deployment model in use was trained through.
 
-    Takes the parsed config. Returns the week per position.
+    Takes the parsed config. Returns the week per position, or a note for a
+    position that ships the baseline, whose model is not read.
     """
-    trained = {}
+    trained: dict[str, Any] = {}
     for position in config["data"]["positions"]:
+        if projector_for(config, position) == PROJECTOR_BASELINE:
+            trained[position] = "baseline: model not used"
+            continue
         _, metadata = train.load_deployment_model(config, position)
         trained[position] = metadata["trained_through"]
     return trained
@@ -1010,5 +1178,7 @@ def top_projections(output: pd.DataFrame, count: int) -> dict[str, pd.DataFrame]
     tops = {}
     for position in sorted(projected["position"].unique().tolist()):
         rows = projected[projected["position"] == position].head(count)
-        tops[position] = rows[["player", "team", "opponent", "projected_points", "flag_team_changed", "injury_report_status"]]
+        tops[position] = rows[
+            ["player", "team", "opponent", "projected_points", "projection_method", "flag_team_changed", "injury_report_status"]
+        ]
     return tops

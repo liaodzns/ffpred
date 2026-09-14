@@ -71,6 +71,7 @@ def output_frame(points: list[float], player_ids: list[str]) -> pd.DataFrame:
             "position": "WR",
             "status": predict.PROJECTED,
             "projected_points": points,
+            "projection_method": predict.PROJECTOR_MODEL,
         }
     )
 
@@ -149,8 +150,133 @@ def test_a_live_projection_refuses_a_stale_model_or_one_that_saw_the_week() -> N
     predict.check_model_is_current(live_model_metadata(2025, 18), "WR", (2025, 9), (2025, 10), True)
 
 
+def projector_config(by_position: dict | None) -> dict:
+    """Build a config with a projector choice per position.
+
+    Takes the per-position overrides, or None to leave the block out entirely.
+    Returns the config.
+    """
+    predict_section: dict = {}
+    if by_position is not None:
+        predict_section["projectors"] = {"default": predict.PROJECTOR_MODEL, "by_position": by_position}
+    return {"data": {"positions": ["QB", "RB"]}, "predict": predict_section}
+
+
+def test_each_position_gets_its_projector_and_the_default_is_the_model() -> None:
+    """An override applies to its own position only, and a config without the block uses models."""
+    config = projector_config({"QB": predict.PROJECTOR_BASELINE})
+
+    assert predict.projector_for(config, "QB") == predict.PROJECTOR_BASELINE
+    assert predict.projector_for(config, "RB") == predict.PROJECTOR_MODEL
+    assert predict.projector_for(projector_config(None), "QB") == predict.PROJECTOR_MODEL
+
+
+def test_an_unknown_projector_or_position_is_refused() -> None:
+    """A typo must not quietly fall back to the model."""
+    with pytest.raises(ValueError, match="Unknown projector"):
+        predict.projector_for(projector_config({"QB": "ensemble"}), "QB")
+    with pytest.raises(ValueError, match="not a modelled position"):
+        predict.projector_for(projector_config({"K": predict.PROJECTOR_BASELINE}), "RB")
+
+
+def labelled_output(methods: list[str | None]) -> pd.DataFrame:
+    """Build an output table with a projected QB, a projected RB, and an excluded RB.
+
+    Takes the projection method of each row in that order. Returns the frame.
+    """
+    return pd.DataFrame(
+        {
+            "player": ["qb", "rb", "out"],
+            "player_id": ["qb", "rb", "out"],
+            "position": ["QB", "RB", "RB"],
+            "status": [predict.PROJECTED, predict.PROJECTED, predict.EXCLUDED],
+            "projected_points": [18.0, 12.0, None],
+            "projection_method": methods,
+        }
+    )
+
+
+def test_every_projected_row_must_name_the_method_its_position_ships() -> None:
+    """Mixed methods pass when each matches the config; a wrong or missing label raises."""
+    config = projector_config({"QB": predict.PROJECTOR_BASELINE})
+
+    # The excluded row has no number, so it carries no method.
+    predict.check_projection_methods(labelled_output(["baseline", "model", None]), config)
+
+    with pytest.raises(ValueError, match="QB"):
+        predict.check_projection_methods(labelled_output(["model", "model", None]), config)
+    with pytest.raises(ValueError, match="RB"):
+        predict.check_projection_methods(labelled_output(["baseline", None, None]), config)
+
+
+TARGET = "fantasy_points_league"
+
+
+def baseline_config() -> dict:
+    """Build the settings the baseline reads.
+
+    Takes nothing. Returns the config.
+    """
+    return {
+        "model": {"baseline": {"method": "rolling_mean", "window": 3}},
+        "features": {"min_prior_games": 3},
+        "scoring": {"target_column": TARGET},
+    }
+
+
+def quarterback_history() -> pd.DataFrame:
+    """Build five weeks for one quarterback, the fifth already played for 100 points.
+
+    Takes nothing. Returns the frame.
+    """
+    return pd.DataFrame(
+        {
+            "player_id": ["qb", "qb", "qb", "qb", "qb"],
+            "position": ["QB", "QB", "QB", "QB", "QB"],
+            "season": [2025, 2025, 2025, 2025, 2025],
+            "week": [1, 2, 3, 4, 5],
+            TARGET: [10.0, 20.0, 30.0, 40.0, 100.0],
+        }
+    )
+
+
+def upcoming_quarterback(week: int) -> pd.DataFrame:
+    """Build the quarterback's upcoming row for one week, with no result.
+
+    Takes the week. Returns the frame.
+    """
+    return pd.DataFrame(
+        {"player_id": ["qb"], "position": ["QB"], "season": [2025], "week": [week], TARGET: [float("nan")]}
+    )
+
+
+def test_the_baseline_projects_the_three_games_before_the_target_week() -> None:
+    """Weeks 2 to 4 average 30. Week 5's own 100 points, already in the table, must not reach it."""
+    projections = predict.baseline_projections(
+        quarterback_history(), upcoming_quarterback(5), baseline_config(), 2025, 5
+    )
+    assert projections.loc["qb"] == pytest.approx(30.0)
+
+
+def test_a_player_without_enough_history_has_no_baseline_and_is_refused() -> None:
+    """Before week 3 he has two games, below the three a projection needs."""
+    with pytest.raises(ValueError, match="no baseline"):
+        predict.baseline_projections(quarterback_history(), upcoming_quarterback(3), baseline_config(), 2025, 3)
+
+
+def test_a_baseline_that_disagrees_with_the_rolling_feature_is_refused() -> None:
+    """The projected number must be the same three game mean the evaluation measured."""
+    projections = pd.Series([30.0], index=["qb"])
+    agreeing = pd.DataFrame({"player_id": ["qb"], "fantasy_points_league_roll3": [30.0]})
+    disagreeing = pd.DataFrame({"player_id": ["qb"], "fantasy_points_league_roll3": [29.5]})
+
+    predict.check_baseline_matches_rolling_mean(projections, agreeing, baseline_config(), "QB")
+    with pytest.raises(ValueError, match="disagree"):
+        predict.check_baseline_matches_rolling_mean(projections, disagreeing, baseline_config(), "QB")
+
+
 def deployment_groups_config() -> dict:
-    """Build a config whose TE override turns injuries on, as the real one does.
+    """Build a config whose TE override turns injuries on, as stage seven's config did.
 
     Takes nothing. Returns the config.
     """

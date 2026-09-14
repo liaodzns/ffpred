@@ -195,34 +195,34 @@ features:
   #
   # The default is stage six's WR setting, carried over unchanged.
   #
-  # opponent_strength is ON, and for WR it is UNRESOLVED. Stage five measured it
+  # opponent_strength is ON, and for WR it is ADOPTED. Stage five measured it
   # once, in one ordering, on one season, and recorded it as harmful. Stage six
   # tested it on one seed against the shipped WR set: adding it improved MAE by
-  # 0.0352, SE 0.0118, t = -3.0. That standard error ignored seed noise, and
-  # 0.0352 sits inside WR's 0.0358 seed range. Stage ten re-tested it averaged
-  # over ten seeds: -0.0224, seed-aware SE 0.0064, t = -3.48. It clears two
-  # standard errors but is still inside the seed range, so it fails the
-  # adoption rule and stays where it was. Seed 42 was the second most
-  # favourable of the ten draws.
+  # 0.0352, SE 0.0118, t = -3.0, but that standard error ignored seed noise.
+  # Stage ten re-tested it averaged over ten seeds: -0.0224, seed-aware SE
+  # 0.0064, t = -3.48, favourable on 10 of 10 seeds, which clears the adoption
+  # rule under evaluation below. Stage ten itself called it unresolved, only
+  # because the effect sat inside WR's 0.0358 seed range, a bar since dropped.
   #
   # player_attributes is OFF, and the question is genuinely unresolved rather
   # than settled: for WR its single-seed effect is -0.0100 against a standard
   # error of 0.0130, t = -0.8. That is well inside the noise, so there is no
   # evidence to turn it on and none to call it useless either.
   #
-  # injuries is OFF by default. The stage seven study found no effect for QB,
-  # RB, or WR, and a marginal one for TE; see the TE override below and
+  # injuries is OFF for every position. The stage seven study found no effect
+  # for QB, RB, or WR, and a marginal single-seed one for TE that the
+  # seed-averaged re-test did not adopt; see the TE override below and
   # src/ffml/features/injuries.py for why the signal is weak by construction.
   #
   # For QB, RB, and TE, stage seven tested every group once, on one seed,
   # against the shipped set, and every result but one kept the inherited
   # default. Single-seed results are not evidence on their own; see CLAUDE.md.
-  # QB's game_context and opportunity looked strongly confirmed on seed 42
-  # (removing either hurt by about 0.17, t = +4.1 and +4.9), but both effects
-  # barely cleared QB's 0.157 seed range. Stage ten re-tested both over ten
-  # seeds: adding game_context improves MAE by 0.098 (seed-aware t = -2.79) and
-  # opportunity by 0.100 (t = -3.47). Both clear two standard errors, both fall
-  # inside the seed range, so both are UNRESOLVED and stay on, as before.
+  # QB's game_context and opportunity are ADOPTED. On seed 42 alone, removing
+  # either looked like it cost about 0.17 (t = +4.1 and +4.9). Over ten seeds,
+  # adding game_context improves MAE by 0.098 (seed-aware t = -2.79, favourable
+  # on 9 of 10 seeds) and opportunity by 0.100 (t = -3.47, 10 of 10). Stage ten
+  # called both unresolved under the dropped seed-range bar. The QB model keeps
+  # them, though QB projections ship the baseline; see predict.projectors.
   #
   # Change a toggle only on the seed-averaged rule, run with
   # scripts/train_model.py --seed-averaged, then rebuild features and retrain.
@@ -240,16 +240,16 @@ features:
       RB: {}
       WR: {}
       TE:
-        # UNRESOLVED, and left on only because that is where it was. The stage
-        # seven study turned it on, on MARGINAL single-seed evidence: adding the
-        # injury report improved TE MAE by 0.0258, SE 0.0121, t = -2.13, failing
-        # both the Bonferroni (|t| > 3.02) and Holm corrections across the 20
-        # tests run. Stage ten re-tested it averaged over ten seeds: -0.0089,
-        # seed-aware SE 0.0065, t = -1.37, against a seed range of 0.0381. It
-        # clears neither bar. The seed-42 figure was the third most favourable
-        # of the ten draws, and three of the ten seeds found the group hurt.
-        # Deployment disables it regardless; see predict.deployment.
-        injuries: true
+        # NOT ADOPTED, so OFF. Stage seven turned it on, on MARGINAL single-seed
+        # evidence: adding the injury report improved TE MAE by 0.0258, SE
+        # 0.0121, t = -2.13, failing both the Bonferroni (|t| > 3.02) and Holm
+        # corrections across the 20 tests run. Stage ten re-tested it averaged
+        # over ten seeds: -0.0089, seed-aware SE 0.0065, t = -1.37, favourable
+        # on only 7 of 10 seeds (seeds 1, 4, and 9 found it hurt). It fails both
+        # bars of the adoption rule. The seed-42 figure was the third most
+        # favourable of the ten draws. Deployment already ran without it, so
+        # live projections are unchanged.
+        injuries: false
 
   # Box score columns turned into lagged rolling means, per position and group.
   # The league target is appended to rolling_production automatically, so its
@@ -439,13 +439,21 @@ evaluation:
 
   # Paired significance tests in the feature study.
   #
-  # decision_t is the t bar of the pre-registered adoption rule. Since stage
-  # ten that rule is seed-averaged: a toggle or parameter changes only when the
-  # change is favourable, beyond this many seed-aware standard errors, and
-  # beyond the seed range, averaged over model.tuning.noise_floor_seeds. Run it
-  # with scripts/train_model.py --seed-averaged. The single-seed feature study
-  # still uses this threshold on its paired standard errors, but those ignore
-  # seed noise and never decide a toggle on their own.
+  # decision_t and min_favourable_seeds are the two bars of the pre-registered
+  # adoption rule. The rule is seed-averaged over model.tuning.noise_floor_seeds
+  # and run with scripts/train_model.py --seed-averaged. A group or parameter is
+  # adopted only if its averaged effect is favourable, exceeds decision_t
+  # seed-aware standard errors, AND is favourable on at least
+  # min_favourable_seeds of the seeds. Anything not adopted is off.
+  #
+  # The consistency count replaced stage ten's seed-range bar. The range says
+  # how much a single run varies, not how precisely an average of ten runs is
+  # known, and it never shrinks as seeds are added, so a small effect measured
+  # reliably could never clear it. The count still rejects an effect carried by
+  # a few lucky seeds.
+  #
+  # The single-seed feature study still uses decision_t on its paired standard
+  # errors, but those ignore seed noise and never decide a toggle on their own.
   #
   # family_alpha is the family-wise error rate used to report whether a result
   # would survive a Bonferroni or Holm correction for the number of tests run.
@@ -454,6 +462,8 @@ evaluation:
   # marginal, since with twenty tests about one will clear two standard errors
   # by chance alone.
   decision_t: 2.0
+  # Out of the ten model.tuning.noise_floor_seeds.
+  min_favourable_seeds: 8
   family_alpha: 0.05
 
   # Report metrics separately for these groups, so that a model that is strong
@@ -489,6 +499,24 @@ predict:
     - Out
     - Doubtful
 
+  # How each position's projections are produced: "model" for the deployment
+  # LightGBM model, "baseline" for the naive mean of the player's last three
+  # games. Every projected row records which one produced it.
+  #
+  # QB ships the BASELINE. Do not switch it back to the model without a
+  # seed-averaged comparison that passes the adoption rule under evaluation.
+  # Over ten seeds on the 2023 and 2024 walk-forward folds, the QB model scored
+  # MAE 6.8577 against the baseline's 6.9807: a gain of 0.123 with a seed-aware
+  # standard error of 0.1234, t = -1.00, inside QB's own 0.157 seed range. Its
+  # earlier single-seed 6.7774 came from its best seed of ten, and even that
+  # never cleared two standard errors (t = 1.67). The QB model, its features,
+  # and its toggles all stay in place and trained; this is a deployment choice,
+  # not a deletion.
+  projectors:
+    default: model
+    by_position:
+      QB: baseline
+
   # Deployment models, trained for live projections on all completed data.
   # These are separate from the walk-forward evaluation models, which are saved
   # directly under data.paths.models and are never overwritten by deployment.
@@ -503,8 +531,10 @@ predict:
     # Groups switched off for deployment only. Injuries are off because nflverse
     # publishes no date_modified for any 2025 or 2026 report, so the pre-kickoff
     # timestamp rule admits none of them and every row would read not_listed.
-    # Its only measured effect was marginal for TE. Remove it from this list if
-    # the timestamps return.
+    # No position's walk-forward config uses the group any more: its only
+    # measured effect, for TE, was not adopted under the seed-averaged rule.
+    # Keep it listed so re-enabling it for evaluation cannot quietly feed
+    # deployment empty reports; remove it only if the timestamps return.
     disabled_groups:
       - injuries
 

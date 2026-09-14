@@ -65,7 +65,8 @@ STUDY_GROUPS_BY_POSITION = {
 # The pre-registered seed-averaged re-tests for stage ten, fixed before anything ran.
 # Only the decisions whose single-seed effect fell inside, or barely outside, their
 # position's stage nine seed range are re-tested; the rest of the study stands. Each
-# group is on in the shipped set and is tested as a single addition to that set.
+# group is tested as a single addition: the shipped set with it against the shipped
+# set without it, whichever of the two currently ships.
 SEED_AVERAGED_RETESTS = {
     "QB": ["game_context", "opportunity"],
     "WR": ["opponent_strength"],
@@ -73,15 +74,16 @@ SEED_AVERAGED_RETESTS = {
 }
 
 # How each seed-averaged verdict reads, for a model against its baseline and for a group.
+# A group is on only if it is adopted; one that fails the rule either way is off.
 HEADLINE_VERDICTS = {
     evaluate.HELPS: "model beats baseline",
     evaluate.HURTS: "BASELINE BEATS MODEL",
     evaluate.UNRESOLVED: "not distinguishable from baseline",
 }
 RETEST_VERDICTS = {
-    evaluate.HELPS: "group helps: keep on",
-    evaluate.HURTS: "group hurts: turn off",
-    evaluate.UNRESOLVED: "unresolved: leave toggle",
+    evaluate.HELPS: "adopted: on",
+    evaluate.HURTS: "rejected: off",
+    evaluate.UNRESOLVED: "not adopted: off",
 }
 
 
@@ -875,21 +877,25 @@ def seed_averaged_retest(
     Takes the parsed config, the position, the group, the player-week frame
     carrying the baseline, and the shipped configuration's per-seed records.
     Returns the seed-averaged comparison with the group off as the reference
-    and the shipped set, group on, as the candidate. Raises ValueError if the
-    group is not on in the shipped set.
-    """
-    if not build_dataset.resolve_groups(config, position).get(group_name, False):
-        raise ValueError(
-            f"{position} {group_name} is off in the shipped set, but the re-test adds it to "
-            "a set without it and compares against the shipped set."
-        )
+    and the group on as the candidate, whichever of the two currently ships.
 
+    The shipped sweep serves the side that matches the config, so only the
+    other side is trained here. A group that was turned off after failing the
+    rule can therefore be re-tested exactly as it was before.
+    """
     seeds = []
     for record in shipped_records:
         seeds.append(record["seed"])
 
-    without_config = config_with_group(config, position, group_name, False)
-    without_records = position_sweep(without_config, position, player_weeks, seeds)
+    shipped_has_group = bool(build_dataset.resolve_groups(config, position).get(group_name, False))
+    flipped_config = config_with_group(config, position, group_name, not shipped_has_group)
+    flipped_records = position_sweep(flipped_config, position, player_weeks, seeds)
+
+    with_records = shipped_records
+    without_records = flipped_records
+    if not shipped_has_group:
+        with_records = flipped_records
+        without_records = shipped_records
 
     shipped_scored = shipped_records[0]["scored"]
     description = f"{position} {group_name}"
@@ -897,7 +903,7 @@ def seed_averaged_retest(
         without_records, MODEL_COLUMN, shipped_scored, description + " off"
     )
     with_projections = sweep_projections(
-        shipped_records, MODEL_COLUMN, shipped_scored, description + " on"
+        with_records, MODEL_COLUMN, shipped_scored, description + " on"
     )
     return evaluate.seed_averaged_comparison(
         shipped_scored[config["scoring"]["target_column"]], without_projections, with_projections
@@ -925,6 +931,7 @@ def seed_averaged_row(
         "candidate_mae": comparison["mae_b_mean"],
         "candidate_sd": comparison["mae_b_sd"],
         "seed_range": comparison["seed_range"],
+        "favourable_seeds": comparison["favourable_seeds"],
         "delta_mae": comparison["delta_mae"],
         "se_row": comparison["se_row"],
         "se_seed": comparison["se_seed"],
@@ -979,9 +986,10 @@ def print_seed_averaged_report(
     decision_t = evaluation_config["decision_t"]
     family_alpha = evaluation_config["family_alpha"]
     seed_count = len(config["model"]["tuning"]["noise_floor_seeds"])
+    min_favourable_seeds = evaluation_config["min_favourable_seeds"]
     rule = (
-        f"  rule: favourable, |t| > {decision_t} on the seed-aware SE, and |delta| above the "
-        "seed range. Both bars."
+        f"  rule: favourable, |t| > {decision_t} on the seed-aware SE, and favourable on at least "
+        f"{min_favourable_seeds} of {seed_count} seeds. Both bars; seed_range is reported, not used."
     )
 
     print_seed_averaged_table(
@@ -999,8 +1007,8 @@ def print_seed_averaged_report(
             f"Seed-averaged re-tests: {len(corrected)} pre-registered tests, nothing saved",
             corrected.drop(columns=["clears_decision_t"]),
             [
-                "  reference is the shipped set without the group, candidate the shipped set; "
-                "delta is with minus without.",
+                "  reference is the shipped set without the group, candidate the shipped set with "
+                "it; delta is with minus without. A group is on only if adopted.",
                 rule,
                 f"  corrections are reported, not used to decide: Bonferroni bar |t| > {bonferroni_bar:.2f}",
             ],
@@ -1026,6 +1034,7 @@ def run_seed_averaged(
     """
     seeds = config["model"]["tuning"]["noise_floor_seeds"]
     decision_t = config["evaluation"]["decision_t"]
+    min_favourable_seeds = config["evaluation"]["min_favourable_seeds"]
 
     headline_rows = []
     retest_rows = []
@@ -1038,14 +1047,14 @@ def run_seed_averaged(
         detail_lines.append(per_seed_line(f"{position} shipped MAE", seeds, shipped_maes))
 
         headline = seed_averaged_headline(config, position, shipped_records)
-        verdict = evaluate.seed_averaged_verdict(headline, decision_t)
+        verdict = evaluate.seed_averaged_verdict(headline, decision_t, min_favourable_seeds)
         headline_rows.append(
             seed_averaged_row(position, BASELINE_TEST, headline, verdict, HEADLINE_VERDICTS)
         )
 
         for group_name in SEED_AVERAGED_RETESTS.get(position, []):
             comparison = seed_averaged_retest(config, position, group_name, player_weeks, shipped_records)
-            verdict = evaluate.seed_averaged_verdict(comparison, decision_t)
+            verdict = evaluate.seed_averaged_verdict(comparison, decision_t, min_favourable_seeds)
             retest_rows.append(
                 seed_averaged_row(position, "add " + group_name, comparison, verdict, RETEST_VERDICTS)
             )

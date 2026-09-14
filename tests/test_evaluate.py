@@ -101,34 +101,80 @@ def test_a_single_seed_is_refused() -> None:
         evaluate.seed_averaged_comparison(ACTUAL, two_seed_reference()[:1], two_seed_candidate()[:1])
 
 
-def test_an_effect_inside_the_seed_range_is_unresolved_however_large_its_t() -> None:
-    """The stage nine trap: WR opponent strength at 0.035 against a 0.036 range, t = -3."""
-    verdict = evaluate.seed_averaged_verdict({"delta_mae": -0.035, "t": -3.0, "seed_range": 0.036}, 2.0)
+def test_the_comparison_counts_the_seeds_on_each_side() -> None:
+    """Both hand-made seeds favour the candidate, by 0.5 and 0.25."""
+    comparison = evaluate.seed_averaged_comparison(ACTUAL, two_seed_reference(), two_seed_candidate())
 
-    assert verdict["verdict"] == evaluate.UNRESOLVED
-    assert "seed range" in verdict["reason"]
-    assert "|t|" not in verdict["reason"]
-
-
-def test_an_effect_at_exactly_the_seed_range_is_unresolved() -> None:
-    """The effect must exceed the range, not merely reach it."""
-    verdict = evaluate.seed_averaged_verdict({"delta_mae": -0.036, "t": -5.0, "seed_range": 0.036}, 2.0)
-    assert verdict["verdict"] == evaluate.UNRESOLVED
+    assert comparison["favourable_seeds"] == 2
+    assert comparison["unfavourable_seeds"] == 0
 
 
-def test_an_effect_beyond_the_range_but_within_two_errors_is_unresolved() -> None:
-    """Clearing seed noise does not rescue an effect the rows cannot separate."""
-    verdict = evaluate.seed_averaged_verdict({"delta_mae": -0.05, "t": -1.5, "seed_range": 0.036}, 2.0)
+def verdict_input(delta_mae: float, t_statistic: float, favourable: int, unfavourable: int) -> dict:
+    """Build the parts of a ten-seed comparison the verdict reads.
+
+    Takes the effect, its t, and how many seeds fell on each side. Returns the
+    comparison. The seed range is set wider than every effect used here, so a
+    verdict that still read it would show up.
+    """
+    return {
+        "seeds": 10,
+        "delta_mae": delta_mae,
+        "t": t_statistic,
+        "favourable_seeds": favourable,
+        "unfavourable_seeds": unfavourable,
+        "seed_range": 0.2,
+    }
+
+
+def test_a_small_effect_measured_reliably_is_adopted_inside_the_seed_range() -> None:
+    """Stage ten's WR opponent strength: -0.0224 at t = -3.48, ten of ten seeds, inside its range.
+
+    The dropped range bar left this unresolved however many seeds were run.
+    """
+    verdict = evaluate.seed_averaged_verdict(verdict_input(-0.0224, -3.48, 10, 0), 2.0, 8)
+    assert verdict["verdict"] == evaluate.HELPS
+
+
+def test_eight_agreeing_seeds_of_ten_is_enough_and_seven_is_not() -> None:
+    """The consistency bar is inclusive at its minimum."""
+    enough = evaluate.seed_averaged_verdict(verdict_input(-0.05, -4.0, 8, 2), 2.0, 8)
+    too_few = evaluate.seed_averaged_verdict(verdict_input(-0.05, -4.0, 7, 3), 2.0, 8)
+
+    assert enough["verdict"] == evaluate.HELPS
+    assert too_few["verdict"] == evaluate.UNRESOLVED
+    assert "7 of 10 seeds favourable, needs 8" in too_few["reason"]
+    assert "|t|" not in too_few["reason"]
+
+
+def test_consistent_seeds_do_not_rescue_an_imprecise_effect() -> None:
+    """Every seed agreeing is not enough when the rows cannot separate the two."""
+    verdict = evaluate.seed_averaged_verdict(verdict_input(-0.05, -1.5, 10, 0), 2.0, 8)
 
     assert verdict["verdict"] == evaluate.UNRESOLVED
     assert "|t|" in verdict["reason"]
-    assert "seed range" not in verdict["reason"]
+    assert "needs" not in verdict["reason"]
 
 
-def test_clearing_both_bars_decides_in_the_direction_of_the_effect() -> None:
-    """Negative deltas help the candidate and positive ones hurt it."""
-    helps = evaluate.seed_averaged_verdict({"delta_mae": -0.05, "t": -4.0, "seed_range": 0.036}, 2.0)
-    hurts = evaluate.seed_averaged_verdict({"delta_mae": 0.05, "t": 4.0, "seed_range": 0.036}, 2.0)
+def test_te_injuries_fails_both_bars() -> None:
+    """Stage ten's TE injuries: -0.0089 at t = -1.37, favourable on seven seeds of ten."""
+    verdict = evaluate.seed_averaged_verdict(verdict_input(-0.0089, -1.37, 7, 3), 2.0, 8)
 
-    assert helps["verdict"] == evaluate.HELPS
+    assert verdict["verdict"] == evaluate.UNRESOLVED
+    assert "|t| 1.37 is not above 2.0" in verdict["reason"]
+    assert "7 of 10 seeds favourable, needs 8" in verdict["reason"]
+
+
+def test_a_harmful_effect_needs_the_same_consistency_on_the_other_side() -> None:
+    """A positive effect counts the seeds it hurt on, not the ones it helped on."""
+    hurts = evaluate.seed_averaged_verdict(verdict_input(0.05, 4.0, 1, 9), 2.0, 8)
+    mixed = evaluate.seed_averaged_verdict(verdict_input(0.05, 4.0, 9, 1), 2.0, 8)
+
     assert hurts["verdict"] == evaluate.HURTS
+    assert mixed["verdict"] == evaluate.UNRESOLVED
+    assert "1 of 10 seeds unfavourable" in mixed["reason"]
+
+
+def test_requiring_more_agreeing_seeds_than_were_run_is_refused() -> None:
+    """Eleven of ten could never be met, so it is a configuration error."""
+    with pytest.raises(ValueError, match="only 10 were run"):
+        evaluate.seed_averaged_verdict(verdict_input(-0.05, -4.0, 10, 0), 2.0, 11)

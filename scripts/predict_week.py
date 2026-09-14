@@ -127,6 +127,10 @@ def print_data_state(result: dict) -> None:
     print(f"  injury rows this season                {freshness['injury_rows_this_season']}, "
           f"timestamped {freshness['injury_rows_timestamped']}, weeks {freshness['injury_weeks_this_season']}")
     print(f"  roster week used                       {result['roster_week']}")
+    methods = []
+    for position in result["projection_methods"]:
+        methods.append(f"{position} {result['projection_methods'][position]}")
+    print(f"  projection method (predict.projectors) {', '.join(methods)}")
     print(f"  models trained through                 {result['trained_through']}")
     print(f"  prior week {history['required_week']} complete     {history['complete']}")
     print(f"  games this week                        {missing['games']}")

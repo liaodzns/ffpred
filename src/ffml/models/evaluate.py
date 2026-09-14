@@ -445,6 +445,7 @@ def _combine_seed_and_row_terms(
 
     spread_a = _seed_spread(maes_a)
     spread_b = _seed_spread(maes_b)
+    favourable_seeds, unfavourable_seeds = _count_seed_directions(seed_differences)
     return {
         "seeds": len(maes_a),
         "rows": len(row_differences),
@@ -456,6 +457,8 @@ def _combine_seed_and_row_terms(
         "mae_b_range": spread_b["range"],
         "seed_range": max(spread_a["range"], spread_b["range"]),
         "seed_differences": seed_differences,
+        "favourable_seeds": favourable_seeds,
+        "unfavourable_seeds": unfavourable_seeds,
         "delta_mae": delta_mae,
         "se_row": se_row,
         "se_seed": se_seed,
@@ -465,39 +468,71 @@ def _combine_seed_and_row_terms(
     }
 
 
-def seed_averaged_verdict(comparison: dict[str, Any], decision_t: float) -> dict[str, str]:
-    """Apply the pre-registered rule to a seed-averaged comparison.
+def _count_seed_directions(seed_differences: list[float]) -> tuple[int, int]:
+    """Count the seeds on which the candidate scored better, and worse.
 
-    Takes the comparison from seed_averaged_comparison and the decision
-    threshold in standard errors. Returns the verdict, helps, hurts, or
-    unresolved, read as what the candidate does, and the reason.
-
-    Both bars must be cleared. The t bar alone is not enough, because stage
-    nine found the seed range itself can exceed two standard errors. The range
-    bar alone is not enough, because an effect can exceed seed noise and still
-    be an accident of which games were played.
+    Takes the per-seed MAE differences, candidate minus reference. Returns how
+    many are below zero and how many above. A seed with no difference counts as
+    neither.
     """
+    favourable = 0
+    unfavourable = 0
+    for difference in seed_differences:
+        if difference < 0:
+            favourable += 1
+        elif difference > 0:
+            unfavourable += 1
+    return favourable, unfavourable
+
+
+def seed_averaged_verdict(
+    comparison: dict[str, Any], decision_t: float, min_favourable_seeds: int
+) -> dict[str, str]:
+    """Apply the pre-registered adoption rule to a seed-averaged comparison.
+
+    Takes the comparison from seed_averaged_comparison, the decision threshold
+    in standard errors, and how many seeds must agree with the direction of the
+    effect. Returns the verdict, helps, hurts, or unresolved, read as what the
+    candidate does, and the reason. Raises ValueError if more seeds must agree
+    than were run.
+
+    Both bars are required. The t bar says the averaged effect is known
+    precisely enough, counting both seed and row noise. The consistency bar
+    says the effect is not the work of a few lucky seeds.
+
+    Stage ten's rule also required the effect to exceed the seed range. That
+    bar was dropped: the range describes how much a single run varies, not how
+    precisely an average of many runs is known, and it never shrinks as seeds
+    are added, so a small effect measured reliably could never pass it. The
+    range is still reported, but it decides nothing.
+    """
+    seed_count = comparison["seeds"]
+    if min_favourable_seeds > seed_count:
+        raise ValueError(f"{min_favourable_seeds} seeds must agree but only {seed_count} were run.")
+
     delta_mae = comparison["delta_mae"]
     t_statistic = comparison["t"]
-    seed_range = comparison["seed_range"]
-
     clears_t = bool(pd.notna(t_statistic) and abs(t_statistic) > decision_t)
-    clears_range = bool(pd.notna(delta_mae) and abs(delta_mae) > seed_range)
 
-    if clears_t and clears_range:
-        reason = (
-            f"|t| {abs(t_statistic):.2f} > {decision_t} and |delta| {abs(delta_mae):.4f} "
-            f"> seed range {seed_range:.4f}"
-        )
-        if delta_mae < 0:
-            return {"verdict": HELPS, "reason": reason}
-        return {"verdict": HURTS, "reason": reason}
+    # A harmful effect is held to the same consistency, counted on the other side.
+    agreeing_seeds = comparison["favourable_seeds"]
+    direction = "favourable"
+    decided = HELPS
+    if pd.notna(delta_mae) and delta_mae > 0:
+        agreeing_seeds = comparison["unfavourable_seeds"]
+        direction = "unfavourable"
+        decided = HURTS
+    consistent = agreeing_seeds >= min_favourable_seeds
+    consistency = f"{agreeing_seeds} of {seed_count} seeds {direction}, needs {min_favourable_seeds}"
+
+    if clears_t and consistent:
+        return {"verdict": decided, "reason": f"|t| {abs(t_statistic):.2f} > {decision_t}; {consistency}"}
 
     failures = []
     if not clears_t:
         failures.append(f"|t| {abs(t_statistic):.2f} is not above {decision_t}")
-    if not clears_range:
-        failures.append(f"|delta| {abs(delta_mae):.4f} is not above the seed range {seed_range:.4f}")
+    if not consistent:
+        failures.append(consistency)
     return {"verdict": UNRESOLVED, "reason": "; ".join(failures)}
 
 
