@@ -265,23 +265,240 @@ def paired_error_comparison(
     errors_b = (actual - y_pred_b[usable_rows]).abs()
     differences = errors_b.to_numpy() - errors_a.to_numpy()
 
-    row_count = len(differences)
-    if row_count < 2:
-        return {"delta_mae": float("nan"), "se": float("nan"), "t": float("nan"), "rows": row_count}
-
-    delta_mae = float(np.mean(differences))
-    standard_error = float(np.std(differences, ddof=1) / np.sqrt(row_count))
-
-    t_statistic = float("nan")
-    if standard_error > 0:
-        t_statistic = delta_mae / standard_error
-
+    delta_mae, standard_error, t_statistic = _mean_difference_and_se(differences)
     return {
         "delta_mae": delta_mae,
         "se": standard_error,
         "t": t_statistic,
-        "rows": row_count,
+        "rows": len(differences),
     }
+
+
+def _mean_difference_and_se(differences: np.ndarray) -> tuple[float, float, float]:
+    """Summarise paired differences as their mean, standard error, and t statistic.
+
+    Takes the paired differences. Returns the mean, its standard error, and the
+    t statistic. All three are NaN with fewer than two differences, and t is NaN
+    when the standard error is zero.
+    """
+    count = len(differences)
+    if count < 2:
+        return float("nan"), float("nan"), float("nan")
+
+    mean_difference = float(np.mean(differences))
+    standard_error = float(np.std(differences, ddof=1) / np.sqrt(count))
+
+    t_statistic = float("nan")
+    if standard_error > 0:
+        t_statistic = mean_difference / standard_error
+    return mean_difference, standard_error, t_statistic
+
+
+# Verdicts of the seed-averaged rule, read as what the candidate does to the reference.
+HELPS = "helps"
+HURTS = "hurts"
+UNRESOLVED = "unresolved"
+
+
+def _check_seed_predictions(
+    y_true: pd.Series, predictions_a: list[pd.Series], predictions_b: list[pd.Series]
+) -> None:
+    """Refuse per-seed predictions that cannot be paired by seed and by row.
+
+    Takes the actual values and the two lists of per-seed predictions. Returns
+    nothing. Raises ValueError if the seed counts differ, fewer than two seeds
+    were run, or any set of predictions has a different length from the actuals.
+    """
+    if len(predictions_a) != len(predictions_b):
+        raise ValueError(
+            f"Seed counts differ: {len(predictions_a)} against {len(predictions_b)}. "
+            "Both configurations must be trained under the same seeds."
+        )
+    if len(predictions_a) < 2:
+        raise ValueError(
+            "At least two seeds are needed, because a single seed gives no estimate of "
+            "how far training randomness moves the result."
+        )
+
+    all_predictions = predictions_a + predictions_b
+    for predictions in all_predictions:
+        if len(predictions) != len(y_true):
+            raise ValueError(
+                f"A set of predictions has {len(predictions)} rows against {len(y_true)} actuals."
+            )
+
+
+def _per_seed_absolute_errors(
+    actual: np.ndarray, predictions: list[pd.Series], usable_rows: np.ndarray
+) -> list[np.ndarray]:
+    """Compute each seed's absolute errors on the usable rows.
+
+    Takes the usable actual values, the per-seed predictions, and the usable row
+    mask. Returns one error array per seed, in seed order.
+    """
+    errors_by_seed = []
+    for seed_predictions in predictions:
+        projected = seed_predictions.to_numpy(dtype=float)[usable_rows]
+        errors_by_seed.append(np.abs(actual - projected))
+    return errors_by_seed
+
+
+def _seed_spread(maes: list[float]) -> dict[str, float]:
+    """Summarise one configuration's MAE across seeds.
+
+    Takes the per-seed MAEs. Returns the mean, the standard deviation, and the
+    best-to-worst range. A deterministic model scores the same under every
+    seed, so both its spread figures are zero.
+    """
+    return {
+        "mean": float(np.mean(maes)),
+        "sd": float(np.std(maes, ddof=1)),
+        "range": float(np.max(maes) - np.min(maes)),
+    }
+
+
+def seed_averaged_comparison(
+    y_true: pd.Series, predictions_a: list[pd.Series], predictions_b: list[pd.Series]
+) -> dict[str, Any]:
+    """Compare two configurations trained under the same seeds, counting seed noise.
+
+    Takes the actual values and, for each configuration, one set of predictions
+    per seed, both lists in the same seed order and every set on the same rows.
+    A deterministic reference such as the naive baseline passes the same
+    predictions once per seed. Returns each side's mean, spread, and range, the
+    per-seed MAE differences, the effect (b minus a), its row and seed standard
+    errors, the combined standard error, t, and the row-only t for contrast.
+
+    paired_error_comparison counts which games happened to be scored but not
+    the randomness of training, so two seeds of one model can "differ" at
+    t = 3. Here the effect is the mean of the per-seed MAE differences, and its
+    standard error adds two independent sources:
+
+    - the seed term, the spread of those differences over the square root of
+      the seed count, which is the training randomness left after averaging.
+      Pairing by seed is valid whatever the correlation between the two sides
+      and gains from it, since bagging draws depend only on the seed.
+    - the row term, the paired standard error of the seed-averaged per-row
+      errors, which is the uncertainty about which games were played. More
+      seeds cannot shrink it.
+
+    The small independent part of per-row seed noise sits in both terms, so the
+    combined error is slightly conservative.
+    """
+    _check_seed_predictions(y_true, predictions_a, predictions_b)
+
+    usable_rows: np.ndarray = y_true.notna().to_numpy()
+    all_predictions = predictions_a + predictions_b
+    for predictions in all_predictions:
+        usable_rows = usable_rows & predictions.notna().to_numpy()
+    rows_dropped = int((~usable_rows).sum())
+    if rows_dropped > 0:
+        logger.info("Seed-averaged comparison: dropped %s rows with a missing value", rows_dropped)
+    if int(usable_rows.sum()) < 2:
+        raise ValueError("Fewer than two rows have every prediction, so nothing can be compared.")
+
+    actual = y_true.to_numpy(dtype=float)[usable_rows]
+    errors_a = _per_seed_absolute_errors(actual, predictions_a, usable_rows)
+    errors_b = _per_seed_absolute_errors(actual, predictions_b, usable_rows)
+
+    maes_a = []
+    maes_b = []
+    seed_differences = []
+    for seed_index in range(len(errors_a)):
+        mae_a = float(np.mean(errors_a[seed_index]))
+        mae_b = float(np.mean(errors_b[seed_index]))
+        maes_a.append(mae_a)
+        maes_b.append(mae_b)
+        seed_differences.append(mae_b - mae_a)
+
+    return _combine_seed_and_row_terms(errors_a, errors_b, maes_a, maes_b, seed_differences)
+
+
+def _combine_seed_and_row_terms(
+    errors_a: list[np.ndarray],
+    errors_b: list[np.ndarray],
+    maes_a: list[float],
+    maes_b: list[float],
+    seed_differences: list[float],
+) -> dict[str, Any]:
+    """Build the seed-averaged comparison from per-seed errors and MAEs.
+
+    Takes each side's per-seed error arrays and MAEs, and the per-seed MAE
+    differences. Returns the comparison dictionary described in
+    seed_averaged_comparison. Raises ValueError if the two ways of computing
+    the effect disagree, which would mean the rows were not paired.
+    """
+    delta_mae, se_seed, _ = _mean_difference_and_se(np.array(seed_differences))
+
+    row_differences = np.mean(errors_b, axis=0) - np.mean(errors_a, axis=0)
+    row_delta, se_row, row_only_t = _mean_difference_and_se(row_differences)
+
+    # Averaging over seeds then rows equals averaging over rows then seeds. A
+    # mismatch can only come from rows that do not line up.
+    if not np.isclose(delta_mae, row_delta, rtol=0.0, atol=1e-9):
+        raise ValueError(f"Effect computed by seed ({delta_mae}) and by row ({row_delta}) disagree.")
+
+    standard_error = float(np.sqrt(se_row**2 + se_seed**2))
+    t_statistic = float("nan")
+    if standard_error > 0:
+        t_statistic = delta_mae / standard_error
+
+    spread_a = _seed_spread(maes_a)
+    spread_b = _seed_spread(maes_b)
+    return {
+        "seeds": len(maes_a),
+        "rows": len(row_differences),
+        "mae_a_mean": spread_a["mean"],
+        "mae_a_sd": spread_a["sd"],
+        "mae_a_range": spread_a["range"],
+        "mae_b_mean": spread_b["mean"],
+        "mae_b_sd": spread_b["sd"],
+        "mae_b_range": spread_b["range"],
+        "seed_range": max(spread_a["range"], spread_b["range"]),
+        "seed_differences": seed_differences,
+        "delta_mae": delta_mae,
+        "se_row": se_row,
+        "se_seed": se_seed,
+        "se": standard_error,
+        "t": t_statistic,
+        "row_only_t": row_only_t,
+    }
+
+
+def seed_averaged_verdict(comparison: dict[str, Any], decision_t: float) -> dict[str, str]:
+    """Apply the pre-registered rule to a seed-averaged comparison.
+
+    Takes the comparison from seed_averaged_comparison and the decision
+    threshold in standard errors. Returns the verdict, helps, hurts, or
+    unresolved, read as what the candidate does, and the reason.
+
+    Both bars must be cleared. The t bar alone is not enough, because stage
+    nine found the seed range itself can exceed two standard errors. The range
+    bar alone is not enough, because an effect can exceed seed noise and still
+    be an accident of which games were played.
+    """
+    delta_mae = comparison["delta_mae"]
+    t_statistic = comparison["t"]
+    seed_range = comparison["seed_range"]
+
+    clears_t = bool(pd.notna(t_statistic) and abs(t_statistic) > decision_t)
+    clears_range = bool(pd.notna(delta_mae) and abs(delta_mae) > seed_range)
+
+    if clears_t and clears_range:
+        reason = (
+            f"|t| {abs(t_statistic):.2f} > {decision_t} and |delta| {abs(delta_mae):.4f} "
+            f"> seed range {seed_range:.4f}"
+        )
+        if delta_mae < 0:
+            return {"verdict": HELPS, "reason": reason}
+        return {"verdict": HURTS, "reason": reason}
+
+    failures = []
+    if not clears_t:
+        failures.append(f"|t| {abs(t_statistic):.2f} is not above {decision_t}")
+    if not clears_range:
+        failures.append(f"|delta| {abs(delta_mae):.4f} is not above the seed range {seed_range:.4f}")
+    return {"verdict": UNRESOLVED, "reason": "; ".join(failures)}
 
 
 def two_sided_p_value(t_statistic: float) -> float:

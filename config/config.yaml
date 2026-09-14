@@ -195,28 +195,37 @@ features:
   #
   # The default is stage six's WR setting, carried over unchanged.
   #
-  # opponent_strength is ON. Stage five measured it once, in one ordering, on
-  # one season, and recorded it as harmful. Tested directly against the shipped
-  # WR set over twice the rows it improves MAE by 0.0352 with a standard error
-  # of 0.0118, t = -3.0. The stage five verdict was an artefact of too little
-  # data and one arbitrary ordering.
+  # opponent_strength is ON, and for WR it is UNRESOLVED. Stage five measured it
+  # once, in one ordering, on one season, and recorded it as harmful. Stage six
+  # tested it on one seed against the shipped WR set: adding it improved MAE by
+  # 0.0352, SE 0.0118, t = -3.0. That standard error ignored seed noise, and
+  # 0.0352 sits inside WR's 0.0358 seed range. Stage ten re-tested it averaged
+  # over ten seeds: -0.0224, seed-aware SE 0.0064, t = -3.48. It clears two
+  # standard errors but is still inside the seed range, so it fails the
+  # adoption rule and stays where it was. Seed 42 was the second most
+  # favourable of the ten draws.
   #
   # player_attributes is OFF, and the question is genuinely unresolved rather
-  # than settled: for WR its effect is -0.0100 against a standard error of
-  # 0.0130, t = -0.8. That is well inside the noise, so there is no evidence to
-  # turn it on and none to call it useless either.
+  # than settled: for WR its single-seed effect is -0.0100 against a standard
+  # error of 0.0130, t = -0.8. That is well inside the noise, so there is no
+  # evidence to turn it on and none to call it useless either.
   #
   # injuries is OFF by default. The stage seven study found no effect for QB,
   # RB, or WR, and a marginal one for TE; see the TE override below and
   # src/ffml/features/injuries.py for why the signal is weak by construction.
   #
-  # For QB, RB, and TE, stage seven tested every group once against the
-  # shipped set. Every result but one kept the inherited default: QB's
-  # game_context and opportunity are strongly confirmed (removing either
-  # hurts at t = +4.1 and +4.9, surviving correction), and the rest were
-  # inconclusive, which under the pre-registered rule keeps the default.
+  # For QB, RB, and TE, stage seven tested every group once, on one seed,
+  # against the shipped set, and every result but one kept the inherited
+  # default. Single-seed results are not evidence on their own; see CLAUDE.md.
+  # QB's game_context and opportunity looked strongly confirmed on seed 42
+  # (removing either hurt by about 0.17, t = +4.1 and +4.9), but both effects
+  # barely cleared QB's 0.157 seed range. Stage ten re-tested both over ten
+  # seeds: adding game_context improves MAE by 0.098 (seed-aware t = -2.79) and
+  # opportunity by 0.100 (t = -3.47). Both clear two standard errors, both fall
+  # inside the seed range, so both are UNRESOLVED and stay on, as before.
   #
-  # Rerun scripts/train_model.py --feature-study after changing anything here.
+  # Change a toggle only on the seed-averaged rule, run with
+  # scripts/train_model.py --seed-averaged, then rebuild features and retrain.
   groups:
     default:
       rolling_production: true
@@ -231,13 +240,15 @@ features:
       RB: {}
       WR: {}
       TE:
-        # Turned on by the stage seven study, on MARGINAL evidence. Adding the
-        # injury report improved TE MAE by 0.0258, SE 0.0121, t = -2.13. That
-        # clears the pre-registered two standard error rule but fails both the
-        # Bonferroni (|t| > 3.02) and Holm corrections across the 20 tests run,
-        # and with 20 tests about 0.9 results are expected to clear two standard
-        # errors by chance. It was the only favourable group result to do so.
-        # Treat it as a weak signal to recheck when more seasons exist.
+        # UNRESOLVED, and left on only because that is where it was. The stage
+        # seven study turned it on, on MARGINAL single-seed evidence: adding the
+        # injury report improved TE MAE by 0.0258, SE 0.0121, t = -2.13, failing
+        # both the Bonferroni (|t| > 3.02) and Holm corrections across the 20
+        # tests run. Stage ten re-tested it averaged over ten seeds: -0.0089,
+        # seed-aware SE 0.0065, t = -1.37, against a seed range of 0.0381. It
+        # clears neither bar. The seed-42 figure was the third most favourable
+        # of the ten draws, and three of the ten seeds found the group hurt.
+        # Deployment disables it regardless; see predict.deployment.
         injuries: true
 
   # Box score columns turned into lagged rolling means, per position and group.
@@ -428,9 +439,13 @@ evaluation:
 
   # Paired significance tests in the feature study.
   #
-  # decision_t is the pre-registered rule from stage six: a feature group's
-  # toggle changes only when flipping it improves MAE by more than this many
-  # paired standard errors.
+  # decision_t is the t bar of the pre-registered adoption rule. Since stage
+  # ten that rule is seed-averaged: a toggle or parameter changes only when the
+  # change is favourable, beyond this many seed-aware standard errors, and
+  # beyond the seed range, averaged over model.tuning.noise_floor_seeds. Run it
+  # with scripts/train_model.py --seed-averaged. The single-seed feature study
+  # still uses this threshold on its paired standard errors, but those ignore
+  # seed noise and never decide a toggle on their own.
   #
   # family_alpha is the family-wise error rate used to report whether a result
   # would survive a Bonferroni or Holm correction for the number of tests run.

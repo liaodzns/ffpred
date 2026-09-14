@@ -62,6 +62,28 @@ STUDY_GROUPS_BY_POSITION = {
     "TE": ["game_context", "opponent_strength", "opportunity", "player_attributes", "injuries"],
 }
 
+# The pre-registered seed-averaged re-tests for stage ten, fixed before anything ran.
+# Only the decisions whose single-seed effect fell inside, or barely outside, their
+# position's stage nine seed range are re-tested; the rest of the study stands. Each
+# group is on in the shipped set and is tested as a single addition to that set.
+SEED_AVERAGED_RETESTS = {
+    "QB": ["game_context", "opportunity"],
+    "WR": ["opponent_strength"],
+    "TE": ["injuries"],
+}
+
+# How each seed-averaged verdict reads, for a model against its baseline and for a group.
+HEADLINE_VERDICTS = {
+    evaluate.HELPS: "model beats baseline",
+    evaluate.HURTS: "BASELINE BEATS MODEL",
+    evaluate.UNRESOLVED: "not distinguishable from baseline",
+}
+RETEST_VERDICTS = {
+    evaluate.HELPS: "group helps: keep on",
+    evaluate.HURTS: "group hurts: turn off",
+    evaluate.UNRESOLVED: "unresolved: leave toggle",
+}
+
 
 def parse_arguments() -> argparse.Namespace:
     """Parse the command line arguments.
@@ -105,6 +127,14 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Retrain each walk-forward model under every seed in model.tuning and report "
             "how far seed luck alone moves it. Saves nothing."
+        ),
+    )
+    parser.add_argument(
+        "--seed-averaged",
+        action="store_true",
+        help=(
+            "Restate each model against its baseline and re-test the marginal group decisions, "
+            "averaged over every seed in model.tuning. Saves nothing."
         ),
     )
     return parser.parse_args()
@@ -586,6 +616,10 @@ def print_study_table(tests: list[dict[str, Any]], config: dict[str, Any]) -> No
         f"{evaluate.bonferroni_t_threshold(family_alpha, test_count):.2f}"
     )
     print("  delta_mae is candidate minus reference; negative favours the candidate.")
+    print(
+        "  These are single-seed results and their standard errors ignore seed noise. "
+        "Change a toggle only on --seed-averaged."
+    )
     print("")
 
 
@@ -645,6 +679,10 @@ def main() -> int:
     player_weeks = load_player_weeks_with_baseline(config)
     if arguments.feature_study:
         run_feature_study(config, positions, player_weeks)
+        return 0
+
+    if arguments.seed_averaged:
+        run_seed_averaged(config, positions, player_weeks)
         return 0
 
     run_training(config, positions, player_weeks)
@@ -767,6 +805,255 @@ def run_noise_floor(config: dict[str, Any], positions: list[str]) -> None:
     for line in per_seed_lines:
         print(line)
     print("")
+
+
+def position_sweep(
+    config: dict[str, Any], position: str, player_weeks: pd.DataFrame, seeds: list[int]
+) -> list[dict[str, Any]]:
+    """Build one configuration's matrix and train it under every seed.
+
+    Takes the parsed config, the position, the player-week frame carrying the
+    baseline, and the seeds. Returns the per-seed records from tune.seed_sweep.
+
+    The matrix is built in memory from the config, as the feature study does,
+    so a variant never needs a saved file of its own.
+    """
+    features = build_position_matrix(player_weeks, config, position)
+    return tune.seed_sweep(features, position, config, seeds)
+
+
+def sweep_projections(
+    records: list[dict[str, Any]], column: str, reference: pd.DataFrame, description: str
+) -> list[pd.Series]:
+    """Collect one projection column from every seed, checking each scored the same rows.
+
+    Takes the per-seed records, the projection column, the scored frame every
+    record must match row for row, and a description for the error. Returns
+    the per-seed projections in seed order.
+    """
+    projections = []
+    for record in records:
+        check_same_scored_rows(reference, record["scored"], f"{description}, seed {record['seed']}")
+        projections.append(record["scored"][column])
+    return projections
+
+
+def seed_averaged_headline(
+    config: dict[str, Any], position: str, shipped_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Compare the shipped model, averaged over seeds, against its baseline.
+
+    Takes the parsed config, the position, and the shipped configuration's
+    per-seed records. Returns the seed-averaged comparison, baseline as the
+    reference and the model as the candidate.
+    """
+    target_column = config["scoring"]["target_column"]
+    shipped_scored = shipped_records[0]["scored"]
+    model_projections = sweep_projections(
+        shipped_records, MODEL_COLUMN, shipped_scored, f"{position} shipped"
+    )
+
+    # The baseline has no seed, so it is passed once per seed and adds no spread.
+    baseline_projections = []
+    for _ in shipped_records:
+        baseline_projections.append(shipped_scored[BASELINE_COLUMN])
+
+    return evaluate.seed_averaged_comparison(
+        shipped_scored[target_column], baseline_projections, model_projections
+    )
+
+
+def seed_averaged_retest(
+    config: dict[str, Any],
+    position: str,
+    group_name: str,
+    player_weeks: pd.DataFrame,
+    shipped_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Re-test one group as a single addition to its position's shipped set.
+
+    Takes the parsed config, the position, the group, the player-week frame
+    carrying the baseline, and the shipped configuration's per-seed records.
+    Returns the seed-averaged comparison with the group off as the reference
+    and the shipped set, group on, as the candidate. Raises ValueError if the
+    group is not on in the shipped set.
+    """
+    if not build_dataset.resolve_groups(config, position).get(group_name, False):
+        raise ValueError(
+            f"{position} {group_name} is off in the shipped set, but the re-test adds it to "
+            "a set without it and compares against the shipped set."
+        )
+
+    seeds = []
+    for record in shipped_records:
+        seeds.append(record["seed"])
+
+    without_config = config_with_group(config, position, group_name, False)
+    without_records = position_sweep(without_config, position, player_weeks, seeds)
+
+    shipped_scored = shipped_records[0]["scored"]
+    description = f"{position} {group_name}"
+    without_projections = sweep_projections(
+        without_records, MODEL_COLUMN, shipped_scored, description + " off"
+    )
+    with_projections = sweep_projections(
+        shipped_records, MODEL_COLUMN, shipped_scored, description + " on"
+    )
+    return evaluate.seed_averaged_comparison(
+        shipped_scored[config["scoring"]["target_column"]], without_projections, with_projections
+    )
+
+
+def seed_averaged_row(
+    position: str,
+    test_name: str,
+    comparison: dict[str, Any],
+    verdict: dict[str, str],
+    labels: dict[str, str],
+) -> dict[str, Any]:
+    """Flatten one seed-averaged comparison into a table row.
+
+    Takes the position, the test name, the comparison, its verdict, and the
+    text each verdict reads as for this kind of test. Returns the row.
+    """
+    return {
+        "position": position,
+        "test": test_name,
+        "rows": comparison["rows"],
+        "reference_mae": comparison["mae_a_mean"],
+        "reference_sd": comparison["mae_a_sd"],
+        "candidate_mae": comparison["mae_b_mean"],
+        "candidate_sd": comparison["mae_b_sd"],
+        "seed_range": comparison["seed_range"],
+        "delta_mae": comparison["delta_mae"],
+        "se_row": comparison["se_row"],
+        "se_seed": comparison["se_seed"],
+        "se": comparison["se"],
+        "t": comparison["t"],
+        "row_only_t": comparison["row_only_t"],
+        "verdict": labels[verdict["verdict"]],
+        "reason": verdict["reason"],
+    }
+
+
+def per_seed_line(label: str, seeds: list[int], values: list[float]) -> str:
+    """Format one value per seed on a single line.
+
+    Takes a label, the seeds, and the values in the same order. Returns the line.
+    """
+    parts = []
+    for seed, value in zip(seeds, values, strict=True):
+        parts.append(f"{seed}:{value:+.4f}")
+    return f"  {label}: " + ", ".join(parts)
+
+
+def print_seed_averaged_table(title: str, table: pd.DataFrame, notes: list[str]) -> None:
+    """Print one seed-averaged table, its verdict reasons, and notes.
+
+    Takes a title, the table with a reason column, and note lines. Returns nothing.
+    """
+    print("")
+    print(title)
+    print("=" * 100)
+    print(table.drop(columns=["reason"]).round(4).to_string(index=False))
+    print("")
+    for _, row in table.iterrows():
+        print(f"  {row['position']} {row['test']}: {row['verdict']}: {row['reason']}")
+    for note in notes:
+        print(note)
+    print("")
+
+
+def print_seed_averaged_report(
+    headline_rows: list[dict[str, Any]],
+    retest_rows: list[dict[str, Any]],
+    detail_lines: list[str],
+    config: dict[str, Any],
+) -> None:
+    """Print the seed-averaged headline, the re-tests with corrections, and per-seed detail.
+
+    Takes the headline rows, the re-test rows, the per-seed lines, and the
+    parsed config. Returns nothing.
+    """
+    evaluation_config = config["evaluation"]
+    decision_t = evaluation_config["decision_t"]
+    family_alpha = evaluation_config["family_alpha"]
+    seed_count = len(config["model"]["tuning"]["noise_floor_seeds"])
+    rule = (
+        f"  rule: favourable, |t| > {decision_t} on the seed-aware SE, and |delta| above the "
+        "seed range. Both bars."
+    )
+
+    print_seed_averaged_table(
+        f"Seed-averaged headline: {seed_count} seeds, pooled walk-forward rows, nothing saved",
+        pd.DataFrame(headline_rows),
+        ["  reference is the baseline, candidate the model; delta is model minus baseline.", rule],
+    )
+
+    if len(retest_rows) > 0:
+        corrected = evaluate.correct_for_multiple_tests(
+            pd.DataFrame(retest_rows), family_alpha, decision_t
+        )
+        bonferroni_bar = evaluate.bonferroni_t_threshold(family_alpha, len(corrected))
+        print_seed_averaged_table(
+            f"Seed-averaged re-tests: {len(corrected)} pre-registered tests, nothing saved",
+            corrected.drop(columns=["clears_decision_t"]),
+            [
+                "  reference is the shipped set without the group, candidate the shipped set; "
+                "delta is with minus without.",
+                rule,
+                f"  corrections are reported, not used to decide: Bonferroni bar |t| > {bonferroni_bar:.2f}",
+            ],
+        )
+
+    print("Per-seed detail: shipped MAE, then each re-test's MAE difference (with minus without)")
+    for line in detail_lines:
+        print(line)
+    print("")
+
+
+def run_seed_averaged(
+    config: dict[str, Any], positions: list[str], player_weeks: pd.DataFrame
+) -> None:
+    """Restate every model against its baseline and re-test the marginal groups, over seeds.
+
+    Takes the parsed config, the positions, and the player-week frame carrying
+    the baseline. Returns nothing.
+
+    Nothing is saved and the config is not changed. Each shipped configuration
+    is trained once under every seed in model.tuning.noise_floor_seeds, and
+    that one sweep serves both its headline and its re-tests.
+    """
+    seeds = config["model"]["tuning"]["noise_floor_seeds"]
+    decision_t = config["evaluation"]["decision_t"]
+
+    headline_rows = []
+    retest_rows = []
+    detail_lines = []
+    for position in positions:
+        shipped_records = position_sweep(config, position, player_weeks, seeds)
+        shipped_maes = []
+        for record in shipped_records:
+            shipped_maes.append(record["mae"])
+        detail_lines.append(per_seed_line(f"{position} shipped MAE", seeds, shipped_maes))
+
+        headline = seed_averaged_headline(config, position, shipped_records)
+        verdict = evaluate.seed_averaged_verdict(headline, decision_t)
+        headline_rows.append(
+            seed_averaged_row(position, BASELINE_TEST, headline, verdict, HEADLINE_VERDICTS)
+        )
+
+        for group_name in SEED_AVERAGED_RETESTS.get(position, []):
+            comparison = seed_averaged_retest(config, position, group_name, player_weeks, shipped_records)
+            verdict = evaluate.seed_averaged_verdict(comparison, decision_t)
+            retest_rows.append(
+                seed_averaged_row(position, "add " + group_name, comparison, verdict, RETEST_VERDICTS)
+            )
+            detail_lines.append(
+                per_seed_line(f"{position} {group_name} delta", seeds, comparison["seed_differences"])
+            )
+
+    print_seed_averaged_report(headline_rows, retest_rows, detail_lines, config)
 
 
 if __name__ == "__main__":
