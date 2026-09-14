@@ -17,8 +17,21 @@ project:
 data:
   # Seasons to download from nflreadpy. Set end_season to null to use
   # nflreadpy.get_current_season() at runtime.
+  #
+  # start_season is the first season the model may be trained, early stopped,
+  # or scored on. It is not the first season downloaded.
   start_season: 2022
   end_season: null
+
+  # Warmup season. Downloaded and used to build rolling features, then dropped
+  # from the feature matrix before any model sees it. Null means no warmup.
+  #
+  # Without it, every player's first three games of start_season fall below
+  # features.min_prior_games and are discarded, which cost 2022 its opening
+  # three weeks entirely and 28% of its rows. One prior season is enough to
+  # carry the longest rolling window into week 1, and pulling further back
+  # reaches into a meaningfully different era of NFL offense.
+  warmup_start_season: 2021
 
   # Skill positions modeled. Kickers and team defenses are out of scope.
   positions:
@@ -26,6 +39,12 @@ data:
     - RB
     - WR
     - TE
+
+  # Season type kept when cleaning. A redraft league finishes in the regular
+  # season, so postseason weeks 19 through 22 are dropped. They are a different
+  # competitive context, played by a quarter of the league, and keeping them
+  # would pollute both the target and the rolling features built from it.
+  season_type: REG
 
   # Tables pulled by src/ffml/data/ingest.py. Set a table to false to skip it.
   tables:
@@ -116,6 +135,12 @@ scoring:
     fumble_lost: -2
     fumble_return_touchdown: 6
 
+    # Kick and punt return touchdowns, credited to the player who returned it.
+    # Verified against the data: the prebuilt nflverse fantasy point columns
+    # include this at 6 points, and without it a standard PPR reproduction of
+    # fantasy_points_ppr misses on exactly the 75 return touchdown rows.
+    special_teams_touchdown: 6
+
 # Kicker and team defense rules are recorded here for reference only. They are
 # not used, because those positions are out of scope for the model.
 #
@@ -161,14 +186,93 @@ features:
   # the season are the main group affected.
   min_prior_games: 3
 
-  # Feature groups. Turn one off to measure how much it contributes.
+  # Feature groups, toggled per position.
+  #
+  # default applies to every position, and by_position overrides single groups
+  # for one position: the same shape as model.lightgbm.shared and by_position.
+  # A group that helps receivers need not help quarterbacks, whose points come
+  # from a different process and whose sample is about a quarter the size.
+  #
+  # The default is stage six's WR setting, carried over unchanged.
+  #
+  # opponent_strength is ON. Stage five measured it once, in one ordering, on
+  # one season, and recorded it as harmful. Tested directly against the shipped
+  # WR set over twice the rows it improves MAE by 0.0352 with a standard error
+  # of 0.0118, t = -3.0. The stage five verdict was an artefact of too little
+  # data and one arbitrary ordering.
+  #
+  # player_attributes is OFF, and the question is genuinely unresolved rather
+  # than settled: for WR its effect is -0.0100 against a standard error of
+  # 0.0130, t = -0.8. That is well inside the noise, so there is no evidence to
+  # turn it on and none to call it useless either.
+  #
+  # injuries is OFF by default. The stage seven study found no effect for QB,
+  # RB, or WR, and a marginal one for TE; see the TE override below and
+  # src/ffml/features/injuries.py for why the signal is weak by construction.
+  #
+  # For QB, RB, and TE, stage seven tested every group once against the
+  # shipped set. Every result but one kept the inherited default: QB's
+  # game_context and opportunity are strongly confirmed (removing either
+  # hurts at t = +4.1 and +4.9, surviving correction), and the rest were
+  # inconclusive, which under the pre-registered rule keeps the default.
+  #
+  # Rerun scripts/train_model.py --feature-study after changing anything here.
   groups:
-    rolling_production: true
-    usage_share: true
-    opportunity: true
-    game_context: true
-    opponent_strength: true
-    player_attributes: true
+    default:
+      rolling_production: true
+      usage_share: true
+      opportunity: true
+      game_context: true
+      opponent_strength: true
+      player_attributes: false
+      injuries: false
+    by_position:
+      QB: {}
+      RB: {}
+      WR: {}
+      TE:
+        # Turned on by the stage seven study, on MARGINAL evidence. Adding the
+        # injury report improved TE MAE by 0.0258, SE 0.0121, t = -2.13. That
+        # clears the pre-registered two standard error rule but fails both the
+        # Bonferroni (|t| > 3.02) and Holm corrections across the 20 tests run,
+        # and with 20 tests about 0.9 results are expected to clear two standard
+        # errors by chance. It was the only favourable group result to do so.
+        # Treat it as a weak signal to recheck when more seasons exist.
+        injuries: true
+
+  # Box score columns turned into lagged rolling means, per position and group.
+  # The league target is appended to rolling_production automatically, so its
+  # three game mean stays identical to the naive baseline.
+  #
+  # Chosen on lagged signal: how well each column's shifted three game mean
+  # tracks the next game's league points, 2022 to 2024. A column meaningless for
+  # a position is left out entirely rather than built and left empty.
+  source_columns:
+    QB:
+      # Volume, efficiency, and rushing. Passing yards and touchdowns restate
+      # attempts and the target, so they are left out.
+      rolling_production: [attempts, passing_epa, rushing_yards]
+      # For a quarterback, snap share mostly says whether he started or was
+      # pulled, which is exactly the thing worth knowing.
+      usage_share: [offense_pct]
+      opportunity: [total_fantasy_points_exp, pass_touchdown_exp]
+    RB:
+      # Carries against targets separates an early down back from a pass
+      # catching one, and in full PPR the two score very differently. A derived
+      # carry share was measured and rejected: it tracks raw carries almost
+      # exactly and adds nothing.
+      rolling_production: [carries, rushing_yards, targets]
+      usage_share: [offense_pct, target_share]
+      opportunity: [total_fantasy_points_exp, rush_touchdown_exp]
+    WR:
+      rolling_production: [targets, receptions, receiving_yards, receiving_tds]
+      usage_share: [offense_pct, target_share]
+      opportunity: [total_fantasy_points_exp, rec_touchdown_exp]
+    TE:
+      # Smaller than the WR set on purpose: tight ends have about half the rows.
+      rolling_production: [targets, receiving_yards]
+      usage_share: [offense_pct, target_share]
+      opportunity: [total_fantasy_points_exp, rec_touchdown_exp]
 
   # Number of prior weeks used to compute how many points a defense has allowed
   # to each position. Null means use all completed weeks of the current season.
@@ -187,11 +291,37 @@ validation:
   validation_season: 2024
   test_season: 2025
 
-  # Walk-forward validation, the more honest evaluation. Retrains for each
-  # season in the list and tests on that season.
+  # Inner split, used only to choose the number of boosting rounds.
+  #
+  # Rows in early_stopping_season from early_stopping_from_week onward are held
+  # out of fitting and are what early stopping watches. validation_season is
+  # then seen by neither fitting nor stopping, so its score is honest. Stopping
+  # on the scored season instead, as stage four did, picks the stopping round
+  # to suit the very rows being reported and flatters the result.
+  #
+  # The cut is by week rather than by season so that training keeps 2022 plus
+  # most of 2023. Holding out all of train_through_season would leave 2022
+  # alone in the training set, which is both small and the weakest season in
+  # the file, since no prior year exists for its rolling windows to draw on.
+  early_stopping_season: 2023
+  early_stopping_from_week: 14
+
+  # Walk-forward validation, the more honest evaluation. Retrains once per test
+  # season, training on everything before it and stopping on the tail of the
+  # season immediately preceding it.
+  #
+  # first_test_season is 2023 rather than 2022 because a 2022 fold would have
+  # no training seasons: 2021 exists only as warmup. last_test_season is stated
+  # rather than derived from test_season so the sealed season never has to be
+  # read to work out which folds to run.
+  #
+  # Pooling two folds roughly doubles the scored rows, which is the point: it
+  # is the only lever left for shrinking the error bars on a feature group's
+  # effect, given the seasons available.
   walk_forward:
-    enabled: false
-    first_test_season: 2022
+    enabled: true
+    first_test_season: 2023
+    last_test_season: 2024
 
 
 # ----------------------------------------------------------------------------
@@ -256,6 +386,21 @@ evaluation:
   # does not beat the baseline is not working, no matter how good its raw
   # error looks.
   always_compare_to_baseline: true
+
+  # Paired significance tests in the feature study.
+  #
+  # decision_t is the pre-registered rule from stage six: a feature group's
+  # toggle changes only when flipping it improves MAE by more than this many
+  # paired standard errors.
+  #
+  # family_alpha is the family-wise error rate used to report whether a result
+  # would survive a Bonferroni or Holm correction for the number of tests run.
+  # It is reported beside every decision rather than used to make it, and a
+  # result that clears decision_t but fails the correction is labelled
+  # marginal, since with twenty tests about one will clear two standard errors
+  # by chance alone.
+  decision_t: 2.0
+  family_alpha: 0.05
 
   # Report metrics separately for these groups, so that a model that is strong
   # overall but weak on starters is not hidden by bench players.
