@@ -6,6 +6,8 @@ real projections worthless, and it fails silently, so the property is checked
 directly here on small synthetic frames with deliberately distinctive values.
 """
 
+import lightgbm as lgb
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -14,7 +16,7 @@ from ffml.features.build_dataset import build_feature_matrix, feature_column_nam
 from ffml.features.opponent import OPPONENT_STRENGTH_FEATURE, add_opponent_strength
 from ffml.features.rolling import GAMES_PLAYED_COLUMN
 from ffml.models.baseline import predict_baseline
-from ffml.models.predict import build_upcoming_rows, upcoming_feature_rows
+from ffml.models.predict import build_upcoming_rows, project_bound, upcoming_feature_rows
 
 TARGET = "fantasy_points_league"
 WINDOW = 3
@@ -699,3 +701,100 @@ def test_the_projected_week_cannot_reach_its_own_upcoming_row() -> None:
         variant_row, _ = project_upcoming(variant)
         for feature_name in feature_names:
             assert same_value(variant_row[feature_name], reference_row[feature_name]), feature_name
+
+
+# ---------------------------------------------------------------------------
+# The quantile path
+#
+# A floor and a ceiling are read off the same upcoming row as the point
+# projection, by a model trained on the same features. The same guarantee must
+# hold for them: nothing about the projected week can reach its own bounds.
+# ---------------------------------------------------------------------------
+
+
+def upcoming_rows_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Build clean_player's week 5 upcoming rows as a frame a booster can read.
+
+    Takes the player-week frame. Returns the rows and the feature names.
+    """
+    upcoming = build_upcoming_rows(
+        frame, upcoming_players(), upcoming_sides(), UPCOMING_SEASON, UPCOMING_WEEK
+    )
+    return upcoming_feature_rows(frame, upcoming, feature_config(), "WR", UPCOMING_SEASON, UPCOMING_WEEK)
+
+
+def tiny_quantile_booster(frame: pd.DataFrame, level: float) -> lgb.Booster:
+    """Train a small quantile model on the synthetic feature rows.
+
+    Takes the player-week frame and the quantile level. Returns the booster.
+
+    It is deliberately allowed to split on single rows, so its predictions move
+    whenever its inputs do, which is what makes the tests below able to fail.
+    """
+    matrix, feature_names = build_feature_matrix(frame, feature_config(), "WR")
+    parameters = {
+        "objective": "quantile",
+        "alpha": level,
+        "num_leaves": 4,
+        "min_data_in_leaf": 1,
+        "min_data_in_bin": 1,
+        "learning_rate": 0.5,
+        "verbosity": -1,
+        "seed": 42,
+    }
+    dataset = lgb.Dataset(matrix[feature_names], label=matrix[TARGET], feature_name=feature_names)
+    return lgb.train(parameters, dataset, num_boost_round=20)
+
+
+def projected_week_variants(frame: pd.DataFrame) -> list[pd.DataFrame]:
+    """Build the three ways the projected week's own results can be disturbed.
+
+    Takes the player-week frame. Returns copies with week 5's results changed,
+    with week 5 deleted, and with a later game added.
+    """
+    is_projected_week = (frame["player_id"] == "clean_player") & (frame["week"] == UPCOMING_WEEK)
+
+    mutated = frame.copy()
+    for column_name in FEATURE_SOURCE_COLUMNS + [TARGET]:
+        mutated.loc[is_projected_week, column_name] = -1000.0
+
+    future_game = frame[is_projected_week].copy()
+    future_game["week"] = UPCOMING_WEEK + 1
+    return [mutated, frame[~is_projected_week], pd.concat([frame, future_game], ignore_index=True)]
+
+
+@pytest.mark.parametrize("level", [0.1, 0.9])
+def test_the_projected_week_cannot_reach_its_own_floor_or_ceiling(level: float) -> None:
+    """Changing, deleting, or adding results at or after week 5 must leave both bounds unchanged."""
+    frame = synthetic_feature_input("WR")
+    booster = tiny_quantile_booster(frame, level)
+    reference_rows, feature_names = upcoming_rows_frame(frame)
+    reference_bound = project_bound(booster, reference_rows, feature_names)
+
+    for variant in projected_week_variants(frame):
+        variant_rows, _ = upcoming_rows_frame(variant)
+        assert np.array_equal(project_bound(booster, variant_rows, feature_names), reference_bound)
+
+
+def test_the_quantile_bound_does_move_when_its_history_changes() -> None:
+    """Guards the test above against passing vacuously on a model that ignores its inputs.
+
+    Changing a game before week 5 changes the upcoming row's features, so it
+    must be able to change the bound.
+    """
+    frame = synthetic_feature_input("WR")
+    booster = tiny_quantile_booster(frame, 0.9)
+    reference_rows, feature_names = upcoming_rows_frame(frame)
+    reference_bound = project_bound(booster, reference_rows, feature_names)
+
+    moved = False
+    for new_value in [0.0, 1000.0]:
+        changed = frame.copy()
+        is_earlier_week = (changed["player_id"] == "clean_player") & (changed["week"] == UPCOMING_WEEK - 1)
+        for column_name in FEATURE_SOURCE_COLUMNS + [TARGET]:
+            changed.loc[is_earlier_week, column_name] = new_value
+        changed_rows, _ = upcoming_rows_frame(changed)
+        if not np.array_equal(project_bound(booster, changed_rows, feature_names), reference_bound):
+            moved = True
+
+    assert moved

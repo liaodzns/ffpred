@@ -421,22 +421,26 @@ def gain_importance_table(result: dict[str, Any], top_n: int) -> pd.DataFrame:
     return table.head(top_n)
 
 
-def save_model(result: dict[str, Any], config: dict[str, Any]) -> tuple[Path, Path]:
+def save_model(
+    result: dict[str, Any], config: dict[str, Any], name_suffix: str = ""
+) -> tuple[Path, Path]:
     """Save the booster and its metadata to the models directory.
 
-    Takes the training result and the parsed config. Returns the paths to the
-    model file and the metadata file.
+    Takes the training result, the parsed config, and an optional file name
+    suffix, such as _q90 for a quantile model. Returns the paths to the model
+    file and the metadata file.
 
     The feature list is stored in order, because the prediction code must build
     its columns in exactly that order for the model to read them correctly. The
     booster is truncated to the best iteration, so the saved artifact is the
-    model that was actually selected rather than the last one fitted.
+    model that was actually selected rather than the last one fitted. The
+    suffix keeps a quantile model from ever overwriting its mean model.
     """
     models_directory = ensure_directory(resolve_path(config["data"]["paths"]["models"]))
     position = result["position"]
 
-    model_path = models_directory / f"lightgbm_{position}.txt"
-    metadata_path = models_directory / f"lightgbm_{position}_metadata.json"
+    model_path = models_directory / f"lightgbm_{position}{name_suffix}.txt"
+    metadata_path = models_directory / f"lightgbm_{position}{name_suffix}_metadata.json"
 
     result["booster"].save_model(str(model_path), num_iteration=result["best_iteration"])
 
@@ -751,29 +755,38 @@ def train_deployment_model(
     }
 
 
-def deployment_model_paths(config: dict[str, Any], position: str) -> tuple[Path, Path]:
+def deployment_model_paths(
+    config: dict[str, Any], position: str, name_suffix: str = ""
+) -> tuple[Path, Path]:
     """Locate a position's deployment model and metadata files.
 
-    Takes the parsed config and the position. Returns the two paths.
+    Takes the parsed config, the position, and an optional file name suffix,
+    such as _q90 for a quantile model. Returns the two paths.
 
     They sit in their own subdirectory, so they can never overwrite the
-    walk-forward models saved directly under data.paths.models.
+    walk-forward models saved directly under data.paths.models, and the suffix
+    keeps a quantile model from overwriting its position's mean model.
     """
     directory = (
         resolve_path(config["data"]["paths"]["models"])
         / config["predict"]["deployment"]["model_subdirectory"]
     )
-    return directory / f"lightgbm_{position}.txt", directory / f"lightgbm_{position}_metadata.json"
+    return (
+        directory / f"lightgbm_{position}{name_suffix}.txt",
+        directory / f"lightgbm_{position}{name_suffix}_metadata.json",
+    )
 
 
-def save_deployment_model(result: dict[str, Any], config: dict[str, Any]) -> tuple[Path, Path]:
+def save_deployment_model(
+    result: dict[str, Any], config: dict[str, Any], name_suffix: str = ""
+) -> tuple[Path, Path]:
     """Save a deployment model and its metadata.
 
-    Takes the deployment training result and the parsed config. Returns the
-    model and metadata paths.
+    Takes the deployment training result, the parsed config, and an optional
+    file name suffix. Returns the model and metadata paths.
     """
     position = result["position"]
-    model_path, metadata_path = deployment_model_paths(config, position)
+    model_path, metadata_path = deployment_model_paths(config, position, name_suffix)
     ensure_directory(model_path.parent)
     result["booster"].save_model(str(model_path))
 
@@ -803,17 +816,23 @@ def save_deployment_model(result: dict[str, Any], config: dict[str, Any]) -> tup
     return model_path, metadata_path
 
 
-def load_deployment_model(config: dict[str, Any], position: str) -> tuple[lgb.Booster, dict[str, Any]]:
+def load_deployment_model(
+    config: dict[str, Any], position: str, name_suffix: str = ""
+) -> tuple[lgb.Booster, dict[str, Any]]:
     """Load a position's deployment model and metadata.
 
-    Takes the parsed config and the position. Returns the booster and the
-    metadata. Raises FileNotFoundError if either file is missing.
+    Takes the parsed config, the position, and an optional file name suffix,
+    such as _q90 for a quantile model. Returns the booster and the metadata.
+    Raises FileNotFoundError if either file is missing.
     """
-    model_path, metadata_path = deployment_model_paths(config, position)
+    model_path, metadata_path = deployment_model_paths(config, position, name_suffix)
     if not model_path.is_file() or not metadata_path.is_file():
+        command = "--deploy"
+        if name_suffix:
+            command = "--deploy-quantiles"
         raise FileNotFoundError(
-            f"No deployment model for {position} at {model_path}. "
-            "Run scripts/train_model.py --deploy first."
+            f"No deployment model for {position}{name_suffix} at {model_path}. "
+            f"Run scripts/train_model.py {command} first."
         )
     booster = lgb.Booster(model_file=str(model_path))
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))

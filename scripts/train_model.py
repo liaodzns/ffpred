@@ -7,7 +7,11 @@ position's shipped configuration, with a multiple-comparisons report across the
 whole family. --deploy trains the live models on every completed week, saved
 apart from the evaluation models and never scored. --noise-floor retrains each
 walk-forward model under several seeds to measure how far seed luck alone moves
-it, which gates whether tuning is worth running. Otherwise every position's
+it, which gates whether tuning is worth running. --seed-averaged restates each
+model against its baseline and re-tests the marginal groups over those seeds.
+--quantiles measures the floor and ceiling models' calibration over the same
+seeds and saves their walk-forward models; --deploy-quantiles trains the live
+quantile models for the bounds that passed. Otherwise every position's
 walk-forward model is trained, scored, and saved.
 
 Every mode retrains once per walk-forward test season and pools the scored
@@ -28,7 +32,7 @@ import pandas as pd
 from ffml.config import ConfigError, load_config
 from ffml.features import build_dataset
 from ffml.features.rolling import rolling_feature_name
-from ffml.models import baseline, evaluate, train, tune
+from ffml.models import baseline, evaluate, predict, quantiles, train, tune
 from ffml.utils.io import read_parquet, resolve_path
 
 # Columns the evaluation groups by when breaking results out.
@@ -138,6 +142,19 @@ def parse_arguments() -> argparse.Namespace:
             "Restate each model against its baseline and re-test the marginal group decisions, "
             "averaged over every seed in model.tuning. Saves nothing."
         ),
+    )
+    parser.add_argument(
+        "--quantiles",
+        action="store_true",
+        help=(
+            "Measure the quantile models' calibration and compare the median with the mean model, "
+            "over every seed in model.tuning. Saves the seed-42 walk-forward quantile models."
+        ),
+    )
+    parser.add_argument(
+        "--deploy-quantiles",
+        action="store_true",
+        help="Train the live quantile models for the bounds predict.intervals ships. Mean models are untouched.",
     )
     return parser.parse_args()
 
@@ -678,6 +695,10 @@ def main() -> int:
         run_noise_floor(config, positions)
         return 0
 
+    if arguments.deploy_quantiles:
+        run_quantile_deployment(config, positions)
+        return 0
+
     player_weeks = load_player_weeks_with_baseline(config)
     if arguments.feature_study:
         run_feature_study(config, positions, player_weeks)
@@ -685,6 +706,10 @@ def main() -> int:
 
     if arguments.seed_averaged:
         run_seed_averaged(config, positions, player_weeks)
+        return 0
+
+    if arguments.quantiles:
+        run_quantiles(config, positions, player_weeks)
         return 0
 
     run_training(config, positions, player_weeks)
@@ -1063,6 +1088,374 @@ def run_seed_averaged(
             )
 
     print_seed_averaged_report(headline_rows, retest_rows, detail_lines, config)
+
+
+# How the median quantile model reads against a point estimate. Reported only: no
+# projector changes on this comparison without the user deciding it.
+MEDIAN_VERDICTS = {
+    evaluate.HELPS: "median better",
+    evaluate.HURTS: "mean better",
+    evaluate.UNRESOLVED: "not distinguishable",
+}
+MEDIAN_VS_BASELINE_VERDICTS = {
+    evaluate.HELPS: "median better",
+    evaluate.HURTS: "baseline better",
+    evaluate.UNRESOLVED: "not distinguishable",
+}
+
+
+def series_arrays(projections: list[pd.Series]) -> list[Any]:
+    """Convert per-seed projections to plain float arrays.
+
+    Takes the projections, one Series per seed. Returns one array per seed.
+    """
+    arrays = []
+    for projection in projections:
+        arrays.append(projection.to_numpy(dtype=float))
+    return arrays
+
+
+def quantile_sweeps(
+    config: dict[str, Any], position: str, features: pd.DataFrame, seeds: list[int]
+) -> tuple[list[dict[str, Any]], dict[float, list[dict[str, Any]]]]:
+    """Train the mean model and every quantile level under every seed.
+
+    Takes the parsed config, the position, its feature matrix, and the seeds.
+    Returns the mean model's per-seed records and each level's.
+
+    Both run through tune.seed_sweep and train.score_walk_forward, so they
+    share folds, guards, and seeds; only the objective differs.
+    """
+    mean_records = tune.seed_sweep(features, position, config, seeds)
+    level_records = {}
+    for level in config["model"]["quantiles"]["levels"]:
+        level_config = quantiles.quantile_config(config, level)
+        level_records[level] = tune.seed_sweep(features, position, level_config, seeds)
+    return mean_records, level_records
+
+
+def point_projections(
+    config: dict[str, Any], position: str, reference: pd.DataFrame, mean_projections: list[pd.Series]
+) -> tuple[list[Any], str]:
+    """Pick the point projection a position ships, per seed.
+
+    Takes the parsed config, the position, the scored rows, and the mean
+    model's projections per seed. Returns the point projection per seed and
+    its name. A baseline position repeats the baseline once per seed.
+    """
+    if predict.projector_for(config, position) == predict.PROJECTOR_BASELINE:
+        points = []
+        for _ in mean_projections:
+            points.append(reference[BASELINE_COLUMN].to_numpy(dtype=float))
+        return points, "baseline"
+    return series_arrays(mean_projections), "model mean"
+
+
+def median_comparison_rows(
+    config: dict[str, Any],
+    position: str,
+    reference: pd.DataFrame,
+    mean_projections: list[pd.Series],
+    median_projections: list[pd.Series],
+) -> list[dict[str, Any]]:
+    """Compare the median quantile model with the mean model, and with the baseline where it ships.
+
+    Takes the parsed config, the position, the scored rows, and the mean and
+    median projections per seed. Returns one seed-averaged table row per
+    comparison. Nothing is switched on the result.
+    """
+    target = reference[config["scoring"]["target_column"]]
+    decision_t = config["evaluation"]["decision_t"]
+    min_favourable_seeds = config["evaluation"]["min_favourable_seeds"]
+
+    comparison = evaluate.seed_averaged_comparison(target, mean_projections, median_projections)
+    verdict = evaluate.seed_averaged_verdict(comparison, decision_t, min_favourable_seeds)
+    rows = [seed_averaged_row(position, "median vs mean", comparison, verdict, MEDIAN_VERDICTS)]
+
+    if predict.projector_for(config, position) == predict.PROJECTOR_BASELINE:
+        baseline_projections = []
+        for _ in median_projections:
+            baseline_projections.append(reference[BASELINE_COLUMN])
+        comparison = evaluate.seed_averaged_comparison(target, baseline_projections, median_projections)
+        verdict = evaluate.seed_averaged_verdict(comparison, decision_t, min_favourable_seeds)
+        rows.append(
+            seed_averaged_row(position, "median vs baseline", comparison, verdict, MEDIAN_VS_BASELINE_VERDICTS)
+        )
+    return rows
+
+
+def calibration_rows(position: str, summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten each level's calibration and verdict into a table row.
+
+    Takes the position and its calibration summary. Returns one row per level.
+    """
+    rows = []
+    for level in summary["levels"]:
+        calibration = summary["levels"][level]
+        overall = calibration["overall"]
+        top_group = calibration["top_group"]
+        top = calibration["groups"][top_group]
+        verdict = "FAIL"
+        if calibration["verdict"]["passed"]:
+            verdict = "pass"
+        rows.append(
+            {
+                "position": position,
+                "test": f"level {level}",
+                "coverage": overall["coverage"],
+                "gap": overall["gap"],
+                "gap_sd": overall["gap_sd"],
+                "gap_range": overall["gap_range"],
+                "seeds_within": overall["seeds_within"],
+                "top_rows": calibration["group_rows"][top_group],
+                "top_coverage": top["coverage"],
+                "top_gap": top["gap"],
+                "top_gap_sd": top["gap_sd"],
+                "top_seeds_within": top["seeds_within"],
+                "verdict": verdict,
+                "reason": calibration["verdict"]["reason"],
+            }
+        )
+    return rows
+
+
+def group_coverage_rows(position: str, summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Lay out each level's seed-averaged coverage in every projection group.
+
+    Takes the position and its calibration summary. Returns one row per level.
+    """
+    rows = []
+    for level in summary["levels"]:
+        calibration = summary["levels"][level]
+        row: dict[str, Any] = {"position": position, "level": level}
+        for group in calibration["groups"]:
+            row[f"group_{group}"] = calibration["groups"][group]["coverage"]
+        rows.append(row)
+    return rows
+
+
+def width_and_diagnostic_rows(
+    position: str, summary: dict[str, Any], point_label: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Describe the interval's width, its crossings, and where the point projection sits.
+
+    Takes the position, its calibration summary, and the name of its point
+    projection. Returns the width row and the diagnostic row.
+    """
+    width = summary["width"]
+    width_row: dict[str, Any] = {"position": position, "width": width["mean"], "width_sd": width["sd"]}
+    counts = []
+    for group in width["groups"]:
+        width_row[f"group_{group}"] = width["groups"][group]
+        counts.append(str(summary["group_rows"][group]))
+    width_row["rows_per_group"] = "/".join(counts)
+
+    diagnostic_row: dict[str, Any] = {"position": position, "point": point_label}
+    for name in summary["crossing"]:
+        diagnostic_row[name] = summary["crossing"][name]
+    diagnostic_row["point_inside_interval"] = summary["containment"]
+    return width_row, diagnostic_row
+
+
+def shipping_line(position: str, summary: dict[str, Any], config: dict[str, Any]) -> str:
+    """State which of a position's bounds the calibration rule lets ship.
+
+    Takes the position, its calibration summary, and the parsed config.
+    Returns the line.
+    """
+    levels = quantiles.bound_levels(config)
+    parts = []
+    for bound in quantiles.BOUNDS:
+        state = "does NOT ship"
+        if summary["levels"][levels[bound]]["verdict"]["passed"]:
+            state = "ships"
+        parts.append(f"{bound} {state}")
+    return f"  {position}: " + ", ".join(parts)
+
+
+def quantile_position_report(
+    config: dict[str, Any], position: str, features: pd.DataFrame, seeds: list[int]
+) -> dict[str, list[Any]]:
+    """Run one position's quantile sweeps and build every report row for it.
+
+    Takes the parsed config, the position, its feature matrix, and the seeds.
+    Returns the rows for each report table, keyed by table.
+    """
+    mean_records, level_records = quantile_sweeps(config, position, features, seeds)
+    reference = mean_records[0]["scored"]
+    mean_projections = sweep_projections(mean_records, MODEL_COLUMN, reference, f"{position} mean")
+
+    projections_by_level = {}
+    arrays_by_level = {}
+    for level in level_records:
+        projections_by_level[level] = sweep_projections(
+            level_records[level], MODEL_COLUMN, reference, f"{position} level {level}"
+        )
+        arrays_by_level[level] = series_arrays(projections_by_level[level])
+
+    points, point_label = point_projections(config, position, reference, mean_projections)
+    actual = reference[config["scoring"]["target_column"]].to_numpy(dtype=float)
+    summary = quantiles.calibrate_position(actual, points, arrays_by_level, config)
+    width_row, diagnostic_row = width_and_diagnostic_rows(position, summary, point_label)
+
+    median_projections = projections_by_level[quantiles.MEDIAN_LEVEL]
+    return {
+        "calibration": calibration_rows(position, summary),
+        "groups": group_coverage_rows(position, summary),
+        "widths": [width_row],
+        "diagnostics": [diagnostic_row],
+        "median": median_comparison_rows(config, position, reference, mean_projections, median_projections),
+        "shipping": [shipping_line(position, summary, config)],
+    }
+
+
+def save_walk_forward_quantiles(config: dict[str, Any], position: str, features: pd.DataFrame) -> list[str]:
+    """Train and save one position's walk-forward quantile models at the project seed.
+
+    Takes the parsed config, the position, and its feature matrix. Returns the
+    saved file names.
+
+    These are the walk-forward models, so they, not the deployment models, are
+    the ones that may be scored on the sealed season once it is unsealed.
+    Nothing here scores it.
+    """
+    saved = []
+    for level in config["model"]["quantiles"]["levels"]:
+        _, results = score_folds(features, position, quantiles.quantile_config(config, level))
+        model_path, _ = train.save_model(results[-1], config, quantiles.level_suffix(level))
+        saved.append(model_path.name)
+    return saved
+
+
+def print_plain_table(title: str, rows: list[dict[str, Any]]) -> None:
+    """Print a titled table.
+
+    Takes the title and the rows. Returns nothing.
+    """
+    print("")
+    print(title)
+    print("=" * 100)
+    print(pd.DataFrame(rows).round(4).to_string(index=False))
+
+
+def print_quantile_report(report: dict[str, list[Any]], config: dict[str, Any]) -> None:
+    """Print the calibration, group, width, diagnostic, median, and shipping tables.
+
+    Takes the collected report rows and the parsed config. Returns nothing.
+    """
+    adoption = config["model"]["quantiles"]["adoption"]
+    seed_count = len(config["model"]["tuning"]["noise_floor_seeds"])
+    rule = (
+        f"  rule, per level: coverage within {adoption['max_overall_gap']} over all rows and within "
+        f"{adoption['max_top_group_gap']} in the top of {adoption['projection_groups']} projection "
+        f"groups, each seed-averaged and in at least {adoption['min_calibrated_seeds']} of {seed_count} seeds."
+    )
+
+    print_seed_averaged_table(
+        f"Quantile calibration: {seed_count} seeds, pooled walk-forward rows; 2025 is never scored",
+        pd.DataFrame(report["calibration"]),
+        ["  coverage is the share of actual scores below the prediction; gap is coverage minus level.", rule],
+    )
+    print_plain_table("Coverage by projection group, seed-averaged (group 1 lowest projections)", report["groups"])
+    print_plain_table("Floor to ceiling width in fantasy points, seed-averaged, by projection group", report["widths"])
+    print_plain_table("Crossing between levels, and the point projection inside the interval", report["diagnostics"])
+    print_seed_averaged_table(
+        "Median against each position's point estimate: reported only, no projector changes",
+        pd.DataFrame(report["median"]),
+        ["  reference is the point estimate, candidate the median; delta is median minus reference."],
+    )
+
+    print("Bounds the pre-registered rule lets ship (record them in predict.intervals)")
+    for line in report["shipping"]:
+        print(line)
+    print("")
+
+
+def run_quantiles(config: dict[str, Any], positions: list[str], player_weeks: pd.DataFrame) -> None:
+    """Measure every position's quantile calibration over seeds and save the walk-forward quantile models.
+
+    Takes the parsed config, the positions, and the player-week frame carrying
+    the baseline. Returns nothing.
+
+    Every figure comes from the pooled walk-forward folds; the sealed season is
+    never scored. The config is not changed here: the shipping verdicts are
+    printed, and recorded in predict.intervals by hand with their evidence.
+    """
+    if not config["model"]["quantiles"]["enabled"]:
+        print("model.quantiles.enabled is false, so no quantile model is trained.")
+        return
+
+    seeds = config["model"]["tuning"]["noise_floor_seeds"]
+    report: dict[str, list[Any]] = {
+        "calibration": [],
+        "groups": [],
+        "widths": [],
+        "diagnostics": [],
+        "median": [],
+        "shipping": [],
+    }
+    saved = []
+    for position in positions:
+        features = load_position_features(config, position, player_weeks)
+        position_report = quantile_position_report(config, position, features, seeds)
+        for table_name in report:
+            for item in position_report[table_name]:
+                report[table_name].append(item)
+        for name in save_walk_forward_quantiles(config, position, features):
+            saved.append(name)
+
+    print_quantile_report(report, config)
+    print(f"Saved seed-{config['project']['random_seed']} walk-forward quantile models: {', '.join(saved)}")
+    print("")
+
+
+def run_quantile_deployment(config: dict[str, Any], positions: list[str]) -> None:
+    """Train and save the live quantile models for the bounds predict.intervals ships.
+
+    Takes the parsed config and the positions. Returns nothing.
+
+    Only shipped bounds are trained, and the mean deployment models are neither
+    retrained nor rewritten. No accuracy is printed, for the same reason as
+    run_deployment: these models train on the sealed season.
+    """
+    raw_directory = resolve_path(config["data"]["paths"]["raw"])
+    processed_directory = resolve_path(config["data"]["paths"]["processed"])
+    schedules = read_parquet(raw_directory / "schedules.parquet")
+    player_weeks = read_parquet(processed_directory / "player_weeks.parquet")
+    completed = train.completed_weeks(schedules, player_weeks, config)
+    levels = quantiles.bound_levels(config)
+
+    table_rows = []
+    for position in positions:
+        bounds = predict.shipped_bounds(config, position)
+        if len(bounds) == 0:
+            continue
+        features = read_parquet(build_dataset.feature_file_path(config, position))
+        for bound in bounds:
+            suffix = quantiles.level_suffix(levels[bound])
+            level_config = quantiles.quantile_config(config, levels[bound])
+            result = train.train_deployment_model(features, position, level_config, completed)
+            model_path, _ = train.save_deployment_model(result, config, suffix)
+            table_rows.append(
+                {
+                    "position": position,
+                    "bound": bound,
+                    "level": levels[bound],
+                    "rounds": result["rounds"],
+                    "refit_rows": len(result["refit_rows"]),
+                    "saved": model_path.name,
+                }
+            )
+
+    print("")
+    print("Quantile deployment models (live projection only; no accuracy is computed from these)")
+    print("=" * 100)
+    print(f"  completed weeks used: {len(completed)}, {completed[0]} through {completed[-1]}")
+    if len(table_rows) == 0:
+        print("  predict.intervals ships no bound for these positions, so nothing was trained.")
+    else:
+        print(pd.DataFrame(table_rows).to_string(index=False))
+    print("")
 
 
 if __name__ == "__main__":

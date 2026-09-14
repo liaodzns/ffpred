@@ -36,8 +36,23 @@ from ffml.features.build_dataset import build_feature_matrix, resolve_groups
 from ffml.features.game_context import home_away
 from ffml.features.opponent import OPPONENT_STRENGTH_FEATURE
 from ffml.features.rolling import GAMES_PLAYED_COLUMN, SORT_COLUMNS, rolling_feature_name
-from ffml.models import baseline, train
+from ffml.models import baseline, quantiles, train
 from ffml.utils.io import ensure_directory, read_parquet, resolve_path
+
+# Written on every row whose interval accompanies a baseline point projection,
+# because the two numbers come from different methods.
+BASELINE_INTERVAL_NOTE = "point from baseline, interval from quantile model"
+
+# What project_position returns for each projected player.
+PROJECTION_COLUMNS = [
+    "player_id",
+    "projected_points",
+    "projection_method",
+    "floor",
+    "ceiling",
+    "interval_note",
+    GAMES_PLAYED_COLUMN,
+]
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +107,9 @@ OUTPUT_COLUMNS = [
     "exclusion_reason",
     "projected_points",
     "projection_method",
+    "floor",
+    "ceiling",
+    "interval_note",
     "injury_report_status",
     "flag_team_changed",
     "flag_early_season",
@@ -100,6 +118,7 @@ OUTPUT_COLUMNS = [
     "flag_kickoff_passed",
     "flag_prior_game_missing",
     "flag_injury_features_disabled",
+    "flag_projection_outside_interval",
     "note",
 ]
 
@@ -786,6 +805,112 @@ def check_projection_methods(output: pd.DataFrame, config: dict[str, Any]) -> No
         raise ValueError("Projection methods disagree with predict.projectors: " + "; ".join(problems))
 
 
+def interval_settings(config: dict[str, Any], position: str) -> dict[str, dict[str, Any]]:
+    """Read whether each bound ships for one position, and why not if it does not.
+
+    Takes the parsed config and the position. Returns, for the floor and the
+    ceiling, whether it ships and its note. A position or bound with no entry
+    in predict.intervals does not ship. Raises ValueError for an entry naming a
+    position that is not modelled.
+
+    The entries record the pre-registered calibration verdicts from
+    scripts/train_model.py --quantiles. A bound that failed is never shown,
+    because a miscalibrated ceiling is worse than none: it will be believed.
+    """
+    intervals = config["predict"].get("intervals") or {}
+    for configured_position in intervals:
+        if configured_position not in config["data"]["positions"]:
+            raise ValueError(f"predict.intervals names {configured_position}, which is not a modelled position.")
+
+    position_settings = intervals.get(position) or {}
+    settings = {}
+    for bound in quantiles.BOUNDS:
+        bound_setting = position_settings.get(bound) or {}
+        note = bound_setting.get("note")
+        if not note:
+            note = "no calibration result recorded"
+        settings[bound] = {"ship": bool(bound_setting.get("ship", False)), "note": note}
+    return settings
+
+
+def shipped_bounds(config: dict[str, Any], position: str) -> list[str]:
+    """List the bounds that ship for one position.
+
+    Takes the parsed config and the position. Returns floor, ceiling, both, or
+    neither, in that order.
+    """
+    settings = interval_settings(config, position)
+    shipped = []
+    for bound in quantiles.BOUNDS:
+        if settings[bound]["ship"]:
+            shipped.append(bound)
+    return shipped
+
+
+def interval_note(config: dict[str, Any], position: str) -> str:
+    """Explain a position's intervals in words for its output rows.
+
+    Takes the parsed config and the position. Returns why each missing bound
+    is missing and, for a baseline position with a bound, that the point and
+    the interval come from different methods. Empty when nothing needs saying.
+    """
+    settings = interval_settings(config, position)
+    parts = []
+    for bound in quantiles.BOUNDS:
+        if not settings[bound]["ship"]:
+            parts.append(f"{bound} not shipped: {settings[bound]['note']}")
+
+    # A quantile interval around a baseline point mixes two methods. That is
+    # stated on every such row rather than resolved silently.
+    if len(shipped_bounds(config, position)) > 0 and projector_for(config, position) == PROJECTOR_BASELINE:
+        parts.append(BASELINE_INTERVAL_NOTE)
+    return "; ".join(parts)
+
+
+def project_bound(booster: Any, rows: pd.DataFrame, feature_names: list[str]) -> Any:
+    """Project one quantile bound for a set of feature rows.
+
+    Takes the quantile booster, the rows, and the ordered feature names.
+    Returns the predictions, reading the columns in the order the model was
+    fitted on.
+    """
+    return booster.predict(rows[feature_names])
+
+
+def interval_projections(
+    context: dict[str, Any], rows: pd.DataFrame, feature_names: list[str], position: str
+) -> pd.DataFrame:
+    """Project the floor and ceiling for one position's upcoming rows.
+
+    Takes the run context, the upcoming feature rows, the ordered feature
+    names, and the position. Returns the floor, ceiling, and interval note,
+    aligned to the rows. A bound that does not ship is left empty.
+
+    A shipped bound's deployment model faces the same checks as a mean model:
+    it must be current, and its feature list must match the builder's.
+    """
+    config = context["config"]
+    levels = quantiles.bound_levels(config)
+    settings = interval_settings(config, position)
+
+    intervals = pd.DataFrame(index=rows.index)
+    for bound in quantiles.BOUNDS:
+        if not settings[bound]["ship"]:
+            intervals[bound] = float("nan")
+            continue
+        suffix = quantiles.level_suffix(levels[bound])
+        booster, metadata = train.load_deployment_model(config, position, suffix)
+        label = f"{position} {bound} ({suffix})"
+        check_model_is_current(
+            metadata, label, context["history"]["latest_completed"], context["target"], context["smoke_test"]
+        )
+        check_feature_list(metadata, booster, feature_names, label)
+        intervals[bound] = project_bound(booster, rows, feature_names)
+
+    intervals["interval_note"] = interval_note(config, position)
+    return intervals
+
+
 def project_position(
     context: dict[str, Any], candidates: pd.DataFrame, position: str
 ) -> tuple[pd.DataFrame | None, list[str]]:
@@ -831,7 +956,11 @@ def project_position(
 
     expected_empty = check_upcoming_features(rows, feature_names, position, week)
     rows["projection_method"] = projector
-    return rows[["player_id", "projected_points", "projection_method", GAMES_PLAYED_COLUMN]], expected_empty
+
+    intervals = interval_projections(context, rows, feature_names, position)
+    for column_name in ["floor", "ceiling", "interval_note"]:
+        rows[column_name] = intervals[column_name]
+    return rows[PROJECTION_COLUMNS], expected_empty
 
 
 def injury_display_status(frame: pd.DataFrame) -> pd.Series:
@@ -874,6 +1003,12 @@ def add_flags(
     flagged["flag_kickoff_passed"] = passed.astype(int)
     flagged["flag_prior_game_missing"] = flagged["team"].isin(missing_teams).astype(int)
 
+    # A mean can sit outside its own 10th to 90th percentile range, so this is
+    # flagged for the reader rather than raised.
+    below_floor = flagged["floor"].notna() & (flagged["projected_points"] < flagged["floor"])
+    above_ceiling = flagged["ceiling"].notna() & (flagged["projected_points"] > flagged["ceiling"])
+    flagged["flag_projection_outside_interval"] = (is_projected & (below_floor | above_ceiling)).astype(int)
+
     disabled = []
     for position in flagged["position"]:
         groups = resolve_groups(deployment_config, position)
@@ -913,6 +1048,8 @@ def assemble_output(
     frame = add_flags(frame, context["deployment_config"], context["now"], context["history"]["teams_missing_prior_game"])
     frame["kickoff_et"] = frame["kickoff"].dt.strftime("%Y-%m-%d %H:%M")
     frame["projected_points"] = frame["projected_points"].round(2)
+    frame["floor"] = frame["floor"].round(2)
+    frame["ceiling"] = frame["ceiling"].round(2)
 
     frame["status_order"] = (frame["status"] == EXCLUDED).astype(int)
     frame = frame.sort_values(
@@ -961,7 +1098,8 @@ def sanity_check(output: pd.DataFrame, ceilings: dict[str, float]) -> pd.DataFra
                 f"{position}: projection {points.max():.2f} above the position's best actual "
                 f"game in training, {ceilings[position]:.1f}."
             )
-        methods = projected[projected["position"] == position]["projection_method"]
+        position_rows = projected[projected["position"] == position]
+        methods = position_rows["projection_method"]
         rows.append(
             {
                 "position": position,
@@ -970,10 +1108,99 @@ def sanity_check(output: pd.DataFrame, ceilings: dict[str, float]) -> pd.DataFra
                 "min": round(float(points.min()), 2),
                 "median": round(float(points.median()), 2),
                 "max": round(float(points.max()), 2),
-                "ceiling": ceilings[position],
+                "best_game": ceilings[position],
+                "floor_median": _median_or_nan(position_rows["floor"]),
+                "ceiling_median": _median_or_nan(position_rows["ceiling"]),
             }
         )
     return pd.DataFrame(rows)
+
+
+def _median_or_nan(values: pd.Series) -> float:
+    """Take the rounded median of the values present, or NaN if there are none.
+
+    Takes the values. Returns the median to two places. A position whose bound
+    does not ship has no values at all, which is expected, not an error.
+    """
+    present = values.dropna()
+    if len(present) == 0:
+        return float("nan")
+    return round(float(present.median()), 2)
+
+
+def position_floors(history: pd.DataFrame, config: dict[str, Any]) -> dict[str, float]:
+    """Find the lowest league score each position actually posted in training.
+
+    Takes the completed history and the parsed config. Returns the minimum per
+    position.
+
+    Fantasy points can go below zero through interceptions and lost fumbles,
+    so a floor may be negative. A floor below the worst game any player at the
+    position actually had means something has gone wrong.
+    """
+    modelled = history[history["season"] >= config["data"]["start_season"]]
+    minima = modelled.groupby("position")[config["scoring"]["target_column"]].min()
+
+    floors = {}
+    for position in minima.index:
+        floors[position] = float(minima.loc[position])
+    return floors
+
+
+def _interval_problems(
+    rows: pd.DataFrame, settings: dict[str, dict[str, Any]], position: str, lowest: float, highest: float
+) -> list[str]:
+    """List everything wrong with one position's floors and ceilings.
+
+    Takes the position's projected rows, its interval settings, the position,
+    and its worst and best actual games. Returns the problems, empty if none.
+    """
+    problems = []
+    for bound in quantiles.BOUNDS:
+        values = rows[bound]
+        if settings[bound]["ship"] and values.isna().any():
+            problems.append(f"{position}: {int(values.isna().sum())} rows missing a shipped {bound}")
+        if not settings[bound]["ship"] and values.notna().any():
+            problems.append(f"{position}: {bound} present but not shipped")
+
+    crossed = rows["floor"].notna() & rows["ceiling"].notna() & (rows["floor"] > rows["ceiling"])
+    if crossed.any():
+        problems.append(f"{position}: {int(crossed.sum())} floors above their ceiling")
+    if (rows["floor"] < lowest).any():
+        problems.append(f"{position}: a floor below the position's worst actual game, {lowest:.1f}")
+    if (rows["ceiling"] > highest).any():
+        problems.append(f"{position}: a ceiling above the position's best actual game, {highest:.1f}")
+    return problems
+
+
+def check_intervals(
+    output: pd.DataFrame, config: dict[str, Any], lowest: dict[str, float], highest: dict[str, float]
+) -> None:
+    """Refuse floors and ceilings that should not be shown.
+
+    Takes the output table, the parsed config, and each position's worst and
+    best actual game in training. Returns nothing. Raises ValueError if a
+    shipped bound is missing, an unshipped one is present, a floor sits above
+    its ceiling, a bound falls outside anything the position has ever scored,
+    or an excluded player carries a bound.
+
+    A bound that failed calibration must never reach the output, because it
+    would be believed.
+    """
+    projected = output[output["status"] == PROJECTED]
+    problems = []
+    for position in sorted(projected["position"].unique().tolist()):
+        rows = projected[projected["position"] == position]
+        settings = interval_settings(config, position)
+        for problem in _interval_problems(rows, settings, position, lowest[position], highest[position]):
+            problems.append(problem)
+
+    excluded = output[output["status"] == EXCLUDED]
+    if excluded["floor"].notna().any() or excluded["ceiling"].notna().any():
+        problems.append("excluded players carry a floor or ceiling")
+
+    if len(problems) > 0:
+        raise ValueError("Interval checks failed: " + "; ".join(problems))
 
 
 def data_freshness(
@@ -1134,8 +1361,10 @@ def run_prediction(
             projection_parts.append(projected)
 
     output = assemble_output(context, candidates, pd.concat(projection_parts, ignore_index=True))
-    distribution = sanity_check(output, position_ceilings(history, config))
+    ceilings = position_ceilings(history, config)
+    distribution = sanity_check(output, ceilings)
     check_projection_methods(output, config)
+    check_intervals(output, config, position_floors(history, config), ceilings)
 
     return {
         "output": output,
@@ -1148,9 +1377,21 @@ def run_prediction(
         "history": context["history"],
         "expected_empty": expected_empty,
         "projection_methods": projection_methods(config),
+        "interval_bounds": interval_bounds_by_position(config),
         "trained_through": _trained_through(config),
         "path": write_projections(output, config, season, week, smoke_test),
     }
+
+
+def interval_bounds_by_position(config: dict[str, Any]) -> dict[str, list[str]]:
+    """List the bounds every modelled position ships.
+
+    Takes the parsed config. Returns the shipped bounds per position.
+    """
+    bounds = {}
+    for position in config["data"]["positions"]:
+        bounds[position] = shipped_bounds(config, position)
+    return bounds
 
 
 def _trained_through(config: dict[str, Any]) -> dict[str, Any]:
@@ -1179,6 +1420,16 @@ def top_projections(output: pd.DataFrame, count: int) -> dict[str, pd.DataFrame]
     for position in sorted(projected["position"].unique().tolist()):
         rows = projected[projected["position"] == position].head(count)
         tops[position] = rows[
-            ["player", "team", "opponent", "projected_points", "projection_method", "flag_team_changed", "injury_report_status"]
+            [
+                "player",
+                "team",
+                "opponent",
+                "projected_points",
+                "projection_method",
+                "floor",
+                "ceiling",
+                "flag_team_changed",
+                "injury_report_status",
+            ]
         ]
     return tops

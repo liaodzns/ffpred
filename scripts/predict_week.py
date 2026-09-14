@@ -131,6 +131,13 @@ def print_data_state(result: dict) -> None:
     for position in result["projection_methods"]:
         methods.append(f"{position} {result['projection_methods'][position]}")
     print(f"  projection method (predict.projectors) {', '.join(methods)}")
+    bounds = []
+    for position in result["interval_bounds"]:
+        shipped = "none"
+        if len(result["interval_bounds"][position]) > 0:
+            shipped = " and ".join(result["interval_bounds"][position])
+        bounds.append(f"{position} {shipped}")
+    print(f"  intervals shipped (predict.intervals)  {', '.join(bounds)}")
     print(f"  models trained through                 {result['trained_through']}")
     print(f"  prior week {history['required_week']} complete     {history['complete']}")
     print(f"  games this week                        {missing['games']}")

@@ -413,14 +413,39 @@ model:
     noise_floor_seeds: [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     effect_band: [0.02, 0.04]
 
-  # Quantile models for floor and ceiling projections. Deferred to version two,
-  # but the settings are here so the code can be written to support them.
+  # Quantile models for floor and ceiling projections, trained with LightGBM's
+  # quantile objective on exactly the mean models' features, folds, parameters,
+  # and seeds. They replace nothing. floor_level is the score a player falls
+  # below one game in ten, ceiling_level the score he stays under nine in ten.
+  # The 0.5 level is a second point estimate, reported against the mean model.
+  #
+  # PRE-REGISTERED before any quantile model was trained. Each level of each
+  # position ships only if, over the ten model.tuning.noise_floor_seeds on the
+  # pooled walk-forward folds, the fraction of actual scores below it is:
+  #   - within max_overall_gap of the level, seed-averaged, AND in at least
+  #     min_calibrated_seeds seeds, over all scored rows; and
+  #   - within max_top_group_gap, the same two ways, among the top group: the
+  #     highest-projected fifth of rows, split by the position's shipped point
+  #     projection. Start/sit decisions are made among those players, so a bound
+  #     miscalibrated for them is miscalibrated where it is used.
+  # The top group is held to a looser gap because it has a fifth of the rows,
+  # so its coverage estimate is noisier; the same 0.05 would be a stricter test
+  # in practice, not an equal one. Floor and ceiling are judged separately, so a
+  # position may ship a ceiling without a floor. Nothing is tuned to rescue a
+  # level that fails, and a failing bound is left empty rather than shown.
   quantiles:
-    enabled: false
+    enabled: true
     levels:
       - 0.1
       - 0.5
       - 0.9
+    floor_level: 0.1
+    ceiling_level: 0.9
+    adoption:
+      max_overall_gap: 0.05
+      max_top_group_gap: 0.08
+      min_calibrated_seeds: 8
+      projection_groups: 5
 
 
 # ----------------------------------------------------------------------------
@@ -516,6 +541,45 @@ predict:
     default: model
     by_position:
       QB: baseline
+
+  # Floors (0.1 quantile) and ceilings (0.9 quantile) shipped per position. The
+  # verdicts come from the pre-registered rule under model.quantiles, measured by
+  # scripts/train_model.py --quantiles over ten seeds on the pooled 2023 and 2024
+  # walk-forward rows. Coverage is the share of actual scores below the bound;
+  # "top group" is the highest-projected fifth of rows. A bound that failed is
+  # left empty in the output with its note and never shown, because a
+  # miscalibrated bound will be believed. Nothing was tuned to rescue a failure.
+  # After changing anything here, retrain the live quantile models with
+  # scripts/train_model.py --deploy-quantiles.
+  intervals:
+    QB:
+      floor:
+        ship: false
+        note: "0.1 quantile failed calibration: coverage 0.188 over all rows, within 0.05 on 0 of 10 seeds"
+      ceiling:
+        ship: false
+        note: "0.9 quantile failed calibration for top-projected players: coverage 0.819, within 0.08 on 7 of 10 seeds"
+    RB:
+      # Passed: coverage 0.116 over all rows and 0.071 in the top group, 10 of 10 seeds each.
+      floor:
+        ship: true
+      ceiling:
+        ship: false
+        note: "0.9 quantile failed calibration for top-projected players: coverage 0.811, within 0.08 on 1 of 10 seeds"
+    WR:
+      # Passed: coverage 0.128 over all rows and 0.083 in the top group, 10 of 10 seeds each.
+      floor:
+        ship: true
+      # Passed: coverage 0.886 over all rows and 0.847 in the top group, 10 of 10 seeds each.
+      ceiling:
+        ship: true
+    TE:
+      floor:
+        ship: false
+        note: "0.1 quantile failed calibration: coverage 0.173 over all rows, within 0.05 on 0 of 10 seeds"
+      ceiling:
+        ship: false
+        note: "0.9 quantile failed calibration for top-projected players: coverage 0.818, within 0.08 on 3 of 10 seeds"
 
   # Deployment models, trained for live projections on all completed data.
   # These are separate from the walk-forward evaluation models, which are saved
