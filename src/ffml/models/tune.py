@@ -48,12 +48,17 @@ def seeded_config(config: dict[str, Any], seed: int) -> dict[str, Any]:
 
 
 def seed_sweep(
-    features: pd.DataFrame, position: str, config: dict[str, Any], seeds: list[int]
+    features: pd.DataFrame,
+    position: str,
+    config: dict[str, Any],
+    seeds: list[int],
+    folds: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Train and score one position's walk-forward model once per seed.
 
-    Takes the feature matrix, the position, the parsed config, and the seeds.
-    Returns one record per seed with its scored rows, pooled MAE, RMSE, rank
+    Takes the feature matrix, the position, the parsed config, the seeds, and
+    optionally the folds to run, defaulting to the walk-forward folds. Returns
+    one record per seed with its scored rows, pooled MAE, RMSE, rank
     correlation, and each fold's best iteration.
 
     Every run uses the same folds, the same features, and the same parameters.
@@ -64,7 +69,7 @@ def seed_sweep(
     records = []
     for seed in seeds:
         seeded = seeded_config(config, seed)
-        scored, results = train.score_walk_forward(features, position, seeded)
+        scored, results = train.score_walk_forward(features, position, seeded, folds)
         evaluation = evaluate.run_evaluation(
             scored[target_column],
             scored[train.MODEL_PROJECTION_COLUMN],

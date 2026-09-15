@@ -124,6 +124,31 @@ def walk_forward_folds(config: dict[str, Any]) -> list[dict[str, Any]]:
     return folds
 
 
+def sealed_holdout_fold(config: dict[str, Any]) -> dict[str, Any]:
+    """Describe the one fold allowed to score the sealed test season.
+
+    Takes the parsed config. Returns a fold specification in the walk-forward
+    shape: training on every season before validation.test_season, early
+    stopping on the tail of the season immediately before it, and scoring it.
+
+    This fold exists for the project's final evaluation, and the season it
+    scores can be spent only once. Its sealed_holdout mark is the only thing
+    that lets the scored split hold test season rows. Training and early
+    stopping stay guarded against the test season exactly as in every other
+    fold, so the models scored on it have never seen it.
+    """
+    validation_config = config["validation"]
+    test_season = validation_config["test_season"]
+    return {
+        "name": f"{test_season} sealed",
+        "train_through_season": test_season - 1,
+        "early_stopping_season": test_season - 1,
+        "early_stopping_from_week": validation_config["early_stopping_from_week"],
+        "validation_season": test_season,
+        "sealed_holdout": True,
+    }
+
+
 def _check_fold(fold: dict[str, Any], config: dict[str, Any]) -> None:
     """Fail if a fold's boundaries are not in chronological order.
 
@@ -154,6 +179,19 @@ def _check_fold(fold: dict[str, Any], config: dict[str, Any]) -> None:
             f"Fold {fold['name']}: early stopping season ({early_stopping_season}) is before "
             f"data.start_season ({start_season}). Warmup seasons build features and are "
             "never fitted, stopped, or scored on."
+        )
+
+    if train_through_season >= validation_season:
+        raise ValueError(
+            f"Fold {fold['name']}: training runs through {train_through_season} but the scored "
+            f"season is {validation_season}. Training must end before the season it is scored on."
+        )
+
+    test_season = config["validation"]["test_season"]
+    if fold.get("sealed_holdout", False) and validation_season != test_season:
+        raise ValueError(
+            f"Fold {fold['name']}: a sealed holdout fold may only score the test season "
+            f"{test_season}, not {validation_season}."
         )
 
 
@@ -238,8 +276,13 @@ def _check_splits(
         ("early stopping", early_stopping_rows),
         ("scored", validation_rows),
     ]
+    # Only the sealed holdout fold may score the test season, and only in its
+    # scored split; _check_fold has already confirmed that split is the test
+    # season itself. Training and early stopping are guarded in every fold.
+    scores_sealed_season = bool(fold.get("sealed_holdout", False))
     for split_name, split_rows in named_splits:
-        _guard_test_season(split_rows, test_season, split_name)
+        if not (scores_sealed_season and split_name == "scored"):
+            _guard_test_season(split_rows, test_season, split_name)
         _guard_warmup_seasons(split_rows, start_season, split_name)
         if len(split_rows) == 0:
             raise ValueError(
@@ -862,21 +905,28 @@ def folds_for(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def score_walk_forward(
-    features: pd.DataFrame, position: str, config: dict[str, Any]
+    features: pd.DataFrame,
+    position: str,
+    config: dict[str, Any],
+    folds: list[dict[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """Train one model per fold and gather every scored row.
 
-    Takes the feature matrix, the position, and the parsed config. Returns the
-    pooled scored rows carrying the projection and a fold label, plus the
-    per-fold training results.
+    Takes the feature matrix, the position, the parsed config, and optionally
+    the folds to run, defaulting to folds_for(config). Returns the pooled
+    scored rows carrying the projection and a fold label, plus the per-fold
+    training results.
 
     Each fold is fitted from scratch, so no fold's model carries what an earlier
     one learned about seasons it was not supposed to have seen yet.
     """
+    if folds is None:
+        folds = folds_for(config)
+
     scored_parts = []
     results = []
 
-    for fold in folds_for(config):
+    for fold in folds:
         result = train_model(features, position, config, fold)
         scored = result["validation_rows"].copy()
         scored[MODEL_PROJECTION_COLUMN] = predict(result, result["validation_rows"])

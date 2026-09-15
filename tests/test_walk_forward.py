@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from ffml.models.train import (
+    sealed_holdout_fold,
     single_holdout_fold,
     split_by_time,
     walk_forward_folds,
@@ -146,6 +147,62 @@ def test_stopping_on_the_scored_season_is_rejected() -> None:
     }
     with pytest.raises(ValueError, match="scored"):
         split_by_time(features, "WR", bad_fold, config)
+
+
+def test_the_sealed_holdout_trains_through_2024_and_scores_only_2025() -> None:
+    """The final fold keeps the walk-forward shape, and no 2025 row reaches fitting or stopping."""
+    config = walk_forward_config()
+    features = synthetic_features()
+    fold = sealed_holdout_fold(config)
+
+    train_rows, stop_rows, scored_rows = split_by_time(features, "WR", fold, config)
+    sealed_index = features.index[features["season"] == TEST_SEASON]
+
+    assert fold["sealed_holdout"] is True
+    assert train_rows["season"].max() == 2024
+    assert train_rows[train_rows["season"] == 2024]["week"].max() == 13
+    assert stop_rows["season"].unique().tolist() == [2024]
+    assert stop_rows["week"].min() == 14
+    assert scored_rows["season"].unique().tolist() == [TEST_SEASON]
+    assert len(scored_rows) == 18
+
+    assert len(train_rows.index.intersection(sealed_index)) == 0
+    assert len(stop_rows.index.intersection(sealed_index)) == 0
+
+
+def test_a_sealed_fold_cannot_train_or_stop_on_the_sealed_season_or_score_another() -> None:
+    """The sealed mark opens the scored split to the test season, and nothing else."""
+    config = walk_forward_config()
+    features = synthetic_features()
+
+    trains_on_sealed = sealed_holdout_fold(config)
+    trains_on_sealed["train_through_season"] = TEST_SEASON
+    with pytest.raises(ValueError, match="Training must end"):
+        split_by_time(features, "WR", trains_on_sealed, config)
+
+    stops_on_sealed = sealed_holdout_fold(config)
+    stops_on_sealed["train_through_season"] = TEST_SEASON
+    stops_on_sealed["early_stopping_season"] = TEST_SEASON
+    with pytest.raises(ValueError, match="scored"):
+        split_by_time(features, "WR", stops_on_sealed, config)
+
+    scores_another = sealed_holdout_fold(config)
+    scores_another["train_through_season"] = 2023
+    scores_another["early_stopping_season"] = 2023
+    scores_another["validation_season"] = 2024
+    with pytest.raises(ValueError, match="may only score the test season"):
+        split_by_time(features, "WR", scores_another, config)
+
+
+def test_scoring_the_sealed_season_without_the_sealed_mark_is_refused() -> None:
+    """A fold that merely names 2025 as its scored season is still stopped by the guard."""
+    config = walk_forward_config()
+    features = synthetic_features()
+
+    unmarked = sealed_holdout_fold(config)
+    unmarked.pop("sealed_holdout")
+    with pytest.raises(ValueError, match="sealed test season"):
+        split_by_time(features, "WR", unmarked, config)
 
 
 def test_the_single_holdout_fold_has_the_same_shape() -> None:

@@ -14,7 +14,10 @@ seeds and saves their walk-forward models; --deploy-quantiles trains the live
 quantile models for the bounds that passed. --point-diagnostics compares the
 median model with the mean model on MAE, RMSE, and within-week rank
 correlation, and tests the point projections for compression; it saves nothing.
-Otherwise every position's walk-forward model is trained, scored, and saved.
+--final-evaluation walk-forward reproduces the stated figures with the final
+evaluation's code, and --final-evaluation sealed scores the sealed test season,
+which can be spent only once. Otherwise every position's walk-forward model is
+trained, scored, and saved.
 
 Every mode retrains once per walk-forward test season and pools the scored
 rows, rather than betting a verdict on a single holdout year.
@@ -164,6 +167,15 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Compare the median quantile model with the mean model on MAE, RMSE, and within-week Spearman, "
             "and test the point projections for compression, over every seed in model.tuning. Saves nothing."
+        ),
+    )
+    parser.add_argument(
+        "--final-evaluation",
+        choices=FINAL_EVALUATION_SCOPES,
+        default=None,
+        help=(
+            "Evaluate the shipped system over every seed in model.tuning. walk-forward scores 2023 and 2024 "
+            "and must reproduce the stated figures; sealed scores validation.test_season, once. Saves nothing."
         ),
     )
     return parser.parse_args()
@@ -724,6 +736,10 @@ def main() -> int:
 
     if arguments.point_diagnostics:
         run_point_diagnostics(config, positions, player_weeks)
+        return 0
+
+    if arguments.final_evaluation is not None:
+        run_final_evaluation(config, positions, player_weeks, arguments.final_evaluation)
         return 0
 
     run_training(config, positions, player_weeks)
@@ -1745,6 +1761,295 @@ def run_point_diagnostics(config: dict[str, Any], positions: list[str], player_w
             slope_rows.append(row)
 
     print_point_diagnostics(metric_rows, group_rows, slope_rows, config)
+
+
+# The two scopes of the final evaluation. walk-forward scores 2023 and 2024 and must
+# reproduce the stated figures; sealed scores the test season, once.
+FINAL_EVALUATION_SCOPES = ["walk-forward", "sealed"]
+
+# How the shipped projector reads against its baseline in the final evaluation.
+FINAL_VERDICTS = {
+    evaluate.HELPS: "beats baseline",
+    evaluate.HURTS: "BASELINE BETTER",
+    evaluate.UNRESOLVED: "not distinguishable",
+}
+
+
+def final_evaluation_folds(config: dict[str, Any], scope: str) -> list[dict[str, Any]]:
+    """List the folds a final evaluation scope runs.
+
+    Takes the parsed config and the scope. Returns the walk-forward folds, or
+    the single sealed holdout fold.
+    """
+    if scope == "sealed":
+        return [train.sealed_holdout_fold(config)]
+    return train.walk_forward_folds(config)
+
+
+def audit_final_folds(
+    config: dict[str, Any], position: str, features: pd.DataFrame, folds: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Prove by row index that no sealed or later row reaches fitting or early stopping.
+
+    Takes the parsed config, the position, its feature matrix, and the folds.
+    Returns one audit row per fold. Raises ValueError if any test season row is
+    in a training or early stopping split, or any later season row is in any
+    split.
+
+    The split guards already refuse this. The audit checks the row indices the
+    models will actually be handed, before anything is trained, so the claim
+    rests on the data rather than on the guard.
+    """
+    test_season = config["validation"]["test_season"]
+    position_rows = features[features["position"] == position]
+    sealed_index = position_rows.index[position_rows["season"] == test_season]
+    later_index = position_rows.index[position_rows["season"] > test_season]
+
+    audit_rows = []
+    for fold in folds:
+        train_rows, stop_rows, scored_rows = train.split_by_time(features, position, fold, config)
+        fitted_index = train_rows.index.union(stop_rows.index)
+        sealed_in_fitting = len(fitted_index.intersection(sealed_index))
+        later_anywhere = len(fitted_index.union(scored_rows.index).intersection(later_index))
+        if sealed_in_fitting > 0 or later_anywhere > 0:
+            raise ValueError(
+                f"{position} fold {fold['name']}: {sealed_in_fitting} test season rows in training or "
+                f"early stopping, {later_anywhere} later-season rows in a split."
+            )
+        audit_rows.append(
+            {
+                "position": position,
+                "fold": fold["name"],
+                "training_rows": len(train_rows),
+                "stopping_rows": len(stop_rows),
+                "scored_rows": len(scored_rows),
+                "scored_seasons": sorted(scored_rows["season"].unique().tolist()),
+                "sealed_rows_fitted_or_stopped": sealed_in_fitting,
+                "sealed_rows_scored": len(scored_rows.index.intersection(sealed_index)),
+                "later_rows_anywhere": later_anywhere,
+            }
+        )
+    return audit_rows
+
+
+def final_evaluation_sweeps(
+    config: dict[str, Any], position: str, features: pd.DataFrame, seeds: list[int], folds: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Train the mean model and each shipped quantile bound under every seed, on the given folds.
+
+    Takes the parsed config, the position, its feature matrix, the seeds, and
+    the folds. Returns the per-seed records keyed mean, floor, or ceiling.
+
+    Everything is trained in memory. No model file is saved or loaded, so no
+    deployment model can reach this evaluation.
+    """
+    records = {"mean": tune.seed_sweep(features, position, config, seeds, folds)}
+    levels = quantiles.bound_levels(config)
+    for bound in predict.shipped_bounds(config, position):
+        level_config = quantiles.quantile_config(config, levels[bound])
+        records[bound] = tune.seed_sweep(features, position, level_config, seeds, folds)
+    return records
+
+
+def check_model_metric(comparison: dict[str, Any], metric: str, records: list[dict[str, Any]]) -> None:
+    """Fail unless each seed's model RMSE or rank correlation matches what run_evaluation recorded.
+
+    Takes the comparison with the model as candidate, the metric, and the
+    model's per-seed records. Returns nothing. Raises ValueError on a difference.
+    """
+    if metric == "mae":
+        return
+    if metric == "spearman" and comparison["groups_dropped"] > 0:
+        return
+    for value, record in zip(comparison["metric_b_by_seed"], records, strict=True):
+        if abs(value - record[metric]) > BASELINE_MATCH_TOLERANCE:
+            raise ValueError(f"Seed {record['seed']}: {metric} {value} differs from the recorded {record[metric]}.")
+
+
+def final_point_rows(
+    config: dict[str, Any], position: str, reference: pd.DataFrame, mean_records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Compare the model with its baseline on MAE, RMSE, and within-week rank correlation.
+
+    Takes the parsed config, the position, the scored rows, and the mean
+    model's per-seed records. Returns one row per metric, naming the method the
+    position ships. For a baseline position the shipped figure is the reference.
+    """
+    target = reference[config["scoring"]["target_column"]]
+    metadata = reference[METADATA_COLUMNS]
+    decision_t = config["evaluation"]["decision_t"]
+    min_seeds = config["evaluation"]["min_favourable_seeds"]
+    model_projections = sweep_projections(mean_records, MODEL_COLUMN, reference, f"{position} model")
+    baseline_projections = []
+    for _ in model_projections:
+        baseline_projections.append(reference[BASELINE_COLUMN])
+
+    rows = []
+    for metric in POINT_DIAGNOSTIC_METRICS:
+        comparison = metric_comparison(metric, target, baseline_projections, model_projections, metadata)
+        check_model_metric(comparison, metric, mean_records)
+        verdict = evaluate.seed_averaged_verdict(comparison, decision_t, min_seeds)
+        row = metric_table_row(position, "model vs baseline", metric, comparison, verdict, FINAL_VERDICTS)
+        row["ships"] = predict.projector_for(config, position)
+        rows.append(row)
+    return rows
+
+
+def final_interval_rows(
+    config: dict[str, Any], position: str, reference: pd.DataFrame, records: dict[str, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Calibrate the position's shipped bounds against the pre-registered tolerances.
+
+    Takes the parsed config, the position, the scored rows, and the per-seed
+    records by model. Returns one calibration row per shipped bound, empty for
+    a position that ships none.
+
+    Groups come from the seed-averaged shipped point projection, as they did
+    when the bounds were adopted.
+    """
+    adoption = config["model"]["quantiles"]["adoption"]
+    levels = quantiles.bound_levels(config)
+    actual = reference[config["scoring"]["target_column"]].to_numpy(dtype=float)
+    mean_projections = sweep_projections(records["mean"], MODEL_COLUMN, reference, f"{position} model")
+    points, _ = point_projections(config, position, reference, mean_projections)
+    groups = quantiles.projection_groups(evaluate.seed_average(points), adoption["projection_groups"])
+
+    rows = []
+    for bound in predict.shipped_bounds(config, position):
+        bound_projections = sweep_projections(records[bound], MODEL_COLUMN, reference, f"{position} {bound}")
+        calibration = quantiles.level_calibration(
+            actual, series_arrays(bound_projections), levels[bound], groups, adoption
+        )
+        calibration["verdict"] = quantiles.level_verdict(calibration, adoption)
+        for row in calibration_rows(position, {"levels": {levels[bound]: calibration}}):
+            row["test"] = f"{bound} (level {levels[bound]})"
+            rows.append(row)
+    return rows
+
+
+def final_compression_rows(
+    config: dict[str, Any], position: str, reference: pd.DataFrame, mean_records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Measure the calibration slope of the model and the baseline, marking which one ships.
+
+    Takes the parsed config, the position, the scored rows, and the mean
+    model's per-seed records. Returns one row per projection.
+    """
+    actual = reference[config["scoring"]["target_column"]].to_numpy(dtype=float)
+    group_count = config["model"]["quantiles"]["adoption"]["projection_groups"]
+    decision_t = config["evaluation"]["decision_t"]
+    min_seeds = config["evaluation"]["min_favourable_seeds"]
+    shipped = predict.projector_for(config, position)
+
+    baseline_arrays = []
+    for _ in mean_records:
+        baseline_arrays.append(reference[BASELINE_COLUMN].to_numpy(dtype=float))
+    model_arrays = series_arrays(sweep_projections(mean_records, MODEL_COLUMN, reference, f"{position} model"))
+    projections_by_name = [(predict.PROJECTOR_MODEL, model_arrays), (predict.PROJECTOR_BASELINE, baseline_arrays)]
+
+    rows = []
+    for name, projections_by_seed in projections_by_name:
+        groups = quantiles.projection_groups(evaluate.seed_average(projections_by_seed), group_count)
+        bias_rows = evaluate.projection_group_bias(actual, projections_by_seed, groups, group_count)
+        slope = evaluate.calibration_slope(actual, projections_by_seed)
+        verdict = evaluate.compression_verdict(bias_rows, slope, decision_t, min_seeds)
+        label = name
+        if name == shipped:
+            label = name + " (shipped)"
+        reading = "not clearly compressed"
+        if verdict["present"]:
+            reading = "compressed"
+        rows.append(
+            {
+                "position": position,
+                "test": label,
+                "slope": slope["slope"],
+                "slope_se": slope["slope_se"],
+                "t_against_one": slope["t_against_one"],
+                "seeds_above_one": slope["seeds_above_one"],
+                "lowest_group_bias": bias_rows[0]["bias"],
+                "highest_group_bias": bias_rows[-1]["bias"],
+                "overall_bias": slope["overall_bias"],
+                "verdict": reading,
+                "reason": verdict["reason"],
+            }
+        )
+    return rows
+
+
+def print_final_evaluation(scope: str, report: dict[str, list[dict[str, Any]]], config: dict[str, Any]) -> None:
+    """Print the index audit, point metrics, interval calibration, and compression tables.
+
+    Takes the scope, the collected report rows, and the parsed config. Returns nothing.
+    """
+    seed_count = len(config["model"]["tuning"]["noise_floor_seeds"])
+    adoption = config["model"]["quantiles"]["adoption"]
+    print("")
+    print("=" * 100)
+    print(f"FINAL EVALUATION, scope {scope}: {seed_count} seeds; every model trained in memory; no model file saved or loaded")
+    print("=" * 100)
+    print_plain_table("Index audit: rows each split holds, and any sealed or later-season row where it must not be", report["audit"])
+    print_seed_averaged_table(
+        "Point metrics: the model against its baseline; 'ships' names what the position projects with",
+        pd.DataFrame(report["points"]),
+        [
+            "  difference is model minus baseline; lower is better for MAE and RMSE, higher for Spearman.",
+            "  favourable_seeds counts seeds where the model beat the baseline on that metric.",
+            "  units are rows for MAE and RMSE, and position-week groups for Spearman.",
+        ],
+    )
+    print_seed_averaged_table(
+        "Interval calibration for the shipped bounds",
+        pd.DataFrame(report["intervals"]),
+        [
+            f"  rule: coverage within {adoption['max_overall_gap']} over all rows and within "
+            f"{adoption['max_top_group_gap']} in the top group, each seed-averaged and in at least "
+            f"{adoption['min_calibrated_seeds']} of {seed_count} seeds.",
+        ],
+    )
+    print_seed_averaged_table(
+        "Compression: calibration slope of actual on projection (1 is calibrated)",
+        pd.DataFrame(report["compression"]),
+        ["  lowest and highest group bias are projected minus actual, in fantasy points."],
+    )
+
+
+def run_final_evaluation(
+    config: dict[str, Any], positions: list[str], player_weeks: pd.DataFrame, scope: str
+) -> None:
+    """Run the final evaluation of the shipped system on one scope.
+
+    Takes the parsed config, the positions, the player-week frame carrying the
+    baseline, and the scope: walk-forward, which must reproduce the stated
+    figures, or sealed, which scores the test season and may be run once.
+    Returns nothing.
+
+    Every position's splits are audited by row index before any model is
+    trained. Nothing is saved, no model file is read, and nothing in the
+    config is changed by what the run shows.
+    """
+    folds = final_evaluation_folds(config, scope)
+    seeds = config["model"]["tuning"]["noise_floor_seeds"]
+    report: dict[str, list[dict[str, Any]]] = {"audit": [], "points": [], "intervals": [], "compression": []}
+
+    features_by_position = {}
+    for position in positions:
+        features_by_position[position] = load_position_features(config, position, player_weeks)
+        for row in audit_final_folds(config, position, features_by_position[position], folds):
+            report["audit"].append(row)
+
+    for position in positions:
+        records = final_evaluation_sweeps(config, position, features_by_position[position], seeds, folds)
+        reference = records["mean"][0]["scored"]
+        for table_name, rows in [
+            ("points", final_point_rows(config, position, reference, records["mean"])),
+            ("intervals", final_interval_rows(config, position, reference, records)),
+            ("compression", final_compression_rows(config, position, reference, records["mean"])),
+        ]:
+            for row in rows:
+                report[table_name].append(row)
+
+    print_final_evaluation(scope, report, config)
 
 
 if __name__ == "__main__":
