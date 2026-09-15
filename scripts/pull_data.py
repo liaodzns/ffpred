@@ -12,6 +12,7 @@ import pandas as pd
 
 from ffml.config import ConfigError, load_config
 from ffml.data import ingest
+from ffml.utils.io import use_utf8_output
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -126,6 +127,7 @@ def main() -> int:
 
     Takes nothing. Returns a process exit code, 0 on success.
     """
+    use_utf8_output()
     arguments = parse_arguments()
     table_names = parse_table_names(arguments.tables)
 

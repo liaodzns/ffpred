@@ -20,6 +20,7 @@ from ffml.config import ConfigError, load_config
 from ffml.data import ingest
 from ffml.data.clean import SCHEDULE_TIME_ZONE
 from ffml.models import predict
+from ffml.utils.io import use_utf8_output
 
 # How many players per position the eyeball check prints.
 TOP_COUNT = 10
@@ -56,6 +57,14 @@ def parse_arguments() -> argparse.Namespace:
         "--log",
         action="store_true",
         help="Log this run's projections and candidates with its time, for in-season scoring. Never overwrites.",
+    )
+    parser.add_argument(
+        weekly.ALLOW_KICKED_OFF_FLAG,
+        action="store_true",
+        help=(
+            "Project a week even though more than weekly.max_kicked_off_share of its games have kicked off, "
+            "for a deliberate retrospective run. Cannot be combined with --log."
+        ),
     )
     return parser.parse_args()
 
@@ -99,14 +108,20 @@ def resolve_target(arguments: argparse.Namespace, config: dict) -> tuple[int, in
     return int(season), int(week)
 
 
-def print_banner(result: dict, season: int, week: int, smoke_test: bool) -> None:
+def print_banner(
+    result: dict, season: int, week: int, smoke_test: bool, retrospective: tuple[int, int] | None
+) -> None:
     """Print the run header, including the warnings that apply to every row.
 
-    Takes the run result, the target season and week, and whether this is a
-    smoke test. Returns nothing.
+    Takes the run result, the target season and week, whether this is a smoke
+    test, and for a run with the kickoff check bypassed, the games kicked off
+    and the games this week (None otherwise). Returns nothing.
     """
     print("")
     print("=" * 88)
+    if retrospective is not None:
+        print(f"RETROSPECTIVE RUN: {retrospective[0]} of {retrospective[1]} games had kicked off when this ran.")
+        print("Projections for those games are not forecasts, and this run was not logged.")
     if smoke_test:
         print(f"SMOKE TEST: season {season} week {week}. NOT A FORECAST.")
         print("The deployment models trained on this week. This run checks the machinery only;")
@@ -208,6 +223,7 @@ def main() -> int:
 
     Takes nothing. Returns a process exit code, 0 on success.
     """
+    use_utf8_output()
     arguments = parse_arguments()
     try:
         config = load_config(arguments.config)
@@ -219,9 +235,25 @@ def main() -> int:
     if arguments.smoke_test and arguments.log:
         print("Cannot log a smoke test: its models trained on the week, so it is not a forecast.", file=sys.stderr)
         return 1
+    if arguments.allow_kicked_off and arguments.log:
+        # A log written after kickoff can never be scored, and it would only add
+        # to the in-season check's count of projections not logged before kickoff.
+        print(
+            f"Cannot log a run with {weekly.ALLOW_KICKED_OFF_FLAG}: its games have kicked off, so it is not a forecast.",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         season, week = resolve_target(arguments, config)
+        # A smoke test projects a completed week by definition and is already
+        # labelled as not a forecast, so only real runs face the kickoff check.
+        retrospective = None
+        if not arguments.smoke_test:
+            if arguments.allow_kicked_off:
+                retrospective = weekly.kickoff_counts(config, season, week)
+            else:
+                weekly.check_kickoff(config, season, week)
         if arguments.require_fresh:
             weekly.check_freshness(config, season, week)
         result = predict.run_prediction(
@@ -239,7 +271,7 @@ def main() -> int:
         print("Cannot project: " + str(error), file=sys.stderr)
         return 1
 
-    print_banner(result, season, week, arguments.smoke_test)
+    print_banner(result, season, week, arguments.smoke_test, retrospective)
     print_data_state(result)
     print_exclusions(result)
     print_checks(result)

@@ -18,6 +18,7 @@ import pandas as pd
 from ffml.config import ConfigError, load_config
 from ffml.data import clean
 from ffml.features import build_dataset
+from ffml.utils.io import use_utf8_output
 
 # A column whose non-null share differs by more than this between its best and
 # worst modelled season is called out. A tenth is large enough to ignore
@@ -160,6 +161,7 @@ def main() -> int:
 
     Takes nothing. Returns a process exit code, 0 on success.
     """
+    use_utf8_output()
     arguments = parse_arguments()
 
     try:

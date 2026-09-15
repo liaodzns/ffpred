@@ -86,6 +86,71 @@ def test_all_problems_are_reported_together() -> None:
     assert len(weekly.freshness_problems(inputs, SEASON, WEEK, 24)) == 3
 
 
+def kickoff_sides(kickoffs: list) -> pd.DataFrame:
+    """Build one game per kickoff time, each with its two team sides.
+
+    Takes the kickoff times, None for a game with no recorded time. Returns the
+    frame.
+    """
+    game_ids = []
+    kickoff_column = []
+    for game_number in range(len(kickoffs)):
+        for _ in range(2):
+            game_ids.append(f"g{game_number}")
+            kickoff_column.append(kickoffs[game_number])
+    return pd.DataFrame({"game_id": game_ids, "kickoff": pd.to_datetime(kickoff_column)})
+
+
+def week_kickoffs(kicked_off: int, games: int) -> list:
+    """Build a week in which a given number of games have already kicked off.
+
+    Takes the number kicked off and the number of games. Returns the kickoff
+    times, the kicked-off ones on Thursday and the rest on Sunday.
+    """
+    kickoffs = []
+    for game_number in range(games):
+        if game_number < kicked_off:
+            kickoffs.append("2026-09-17 20:15")
+        else:
+            kickoffs.append("2026-09-20 13:00")
+    return kickoffs
+
+
+SUNDAY_MORNING = pd.Timestamp("2026-09-20 10:00")
+
+
+def test_kicked_off_games_are_counted_once_each() -> None:
+    """Two team sides of one game count as one game, and a game kicking off now has kicked off."""
+    sides = kickoff_sides(["2026-09-17 20:15", "2026-09-20 10:00", "2026-09-20 13:00", None])
+    assert weekly.kicked_off_games(sides, SUNDAY_MORNING) == (2, 4)
+
+
+def test_a_week_with_too_many_games_kicked_off_fails() -> None:
+    """A late-week run passes with Thursday and holiday games gone, and fails once the Sunday slate starts."""
+    passing = weekly.kicked_off_games(kickoff_sides(week_kickoffs(6, 16)), SUNDAY_MORNING)
+    assert weekly.kickoff_problems(passing[0], passing[1], SEASON, WEEK, 0.40) == []
+
+    failing = weekly.kicked_off_games(kickoff_sides(week_kickoffs(7, 16)), SUNDAY_MORNING)
+    problems = weekly.kickoff_problems(failing[0], failing[1], SEASON, WEEK, 0.40)
+    assert len(problems) == 1
+    assert "7 of 16 games in 2026 week 2 have already kicked off (44%), over the 40% limit" in problems[0]
+    assert "--allow-kicked-off" in problems[0]
+    assert "never logged" in problems[0]
+
+
+def test_a_bye_week_uses_its_own_game_count() -> None:
+    """With 13 games, 5 kicked off is under the limit and 6 is over it."""
+    assert weekly.kickoff_problems(5, 13, SEASON, WEEK, 0.40) == []
+    assert len(weekly.kickoff_problems(6, 13, SEASON, WEEK, 0.40)) == 1
+
+
+def test_a_week_with_no_games_is_left_to_the_schedule_check() -> None:
+    """No games means no kickoff problem; the freshness checks report the missing schedule."""
+    empty = kickoff_sides([]).iloc[0:0]
+    assert weekly.kicked_off_games(empty, SUNDAY_MORNING) == (0, 0)
+    assert weekly.kickoff_problems(0, 0, SEASON, WEEK, 0.40) == []
+
+
 def run_result() -> dict:
     """Build a minimal projection run result to log.
 

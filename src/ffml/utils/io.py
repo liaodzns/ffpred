@@ -9,11 +9,28 @@ module for path handling, so importing it back would create a cycle.
 """
 
 import logging
+import sys
+from io import TextIOWrapper
 from pathlib import Path
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def use_utf8_output() -> None:
+    """Make printed and logged text UTF-8, including when output is redirected.
+
+    Takes nothing. Returns nothing.
+
+    On Windows, Python writes redirected output in the ANSI code page, so a
+    name such as Estimé reaches the file as a byte no UTF-8 reader can show.
+    The streams are reconfigured in place, so log handlers already holding
+    them are covered too.
+    """
+    for stream in [sys.stdout, sys.stderr]:
+        if isinstance(stream, TextIOWrapper):
+            stream.reconfigure(encoding="utf-8")
 
 
 def project_root() -> Path:

@@ -20,6 +20,7 @@ from pathlib import Path
 from ffml import weekly
 from ffml.config import ConfigError, load_config
 from ffml.data import ingest
+from ffml.utils.io import use_utf8_output
 
 SCRIPTS_DIRECTORY = Path(__file__).resolve().parent
 
@@ -60,6 +61,7 @@ def main() -> int:
 
     Takes nothing. Returns a process exit code, 0 on success.
     """
+    use_utf8_output()
     arguments = parse_arguments()
     try:
         config = load_config(arguments.config)
@@ -85,7 +87,14 @@ def main() -> int:
         run_step("1. Pull data", ["pull_data.py"] + config_arguments)
         run_step("2. Clean and build features", ["build_features.py"] + config_arguments)
         print("")
-        print(f"# 3. Freshness check for {season} week {week}")
+        print(f"# 3. Kickoff and freshness checks for {season} week {week}")
+        # Flushed so this header lands before a failure message on stderr when the
+        # run is redirected to one file.
+        sys.stdout.flush()
+        # The kickoff check has no override here: the routine always logs, and a
+        # log written after kickoff can never be scored.
+        kicked_off, games = weekly.check_kickoff(config, season, week)
+        print(f"  {kicked_off} of {games} games have kicked off, within weekly.max_kicked_off_share")
         weekly.check_freshness(config, season, week)
         print("  schedule, last week's results, injury report, weekly roster, and betting lines are current")
         run_step("4. Check roster names", ["start_sit.py", "--resolve-only"] + target_arguments + config_arguments)

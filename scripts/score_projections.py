@@ -20,7 +20,7 @@ from ffml import monitor, weekly
 from ffml.config import ConfigError, load_config
 from ffml.data import ingest
 from ffml.models import predict
-from ffml.utils.io import read_parquet, resolve_path
+from ffml.utils.io import read_parquet, resolve_path, use_utf8_output
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -68,6 +68,7 @@ def main() -> int:
 
     Takes nothing. Returns a process exit code, 0 on success.
     """
+    use_utf8_output()
     arguments = parse_arguments()
     try:
         config = load_config(arguments.config)

@@ -5,7 +5,9 @@ If the injury report is a day old, last week's games have not all landed, or a
 betting line is missing, the projection is quietly worse and nothing on screen
 says so. The checks here refuse to project at all in that state. The row flags
 already in the pipeline remain for what cannot be refused, such as a Thursday
-game that has already kicked off.
+game that has already kicked off. A run made once a meaningful share of the
+week's games have kicked off is refused too, since its output would look like a
+forecast of games already played.
 
 Every projection run is also logged with its time, and a log is never
 overwritten, so what was projected before kickoff can later be scored against
@@ -19,10 +21,15 @@ from typing import Any
 
 import pandas as pd
 
+from ffml.data.clean import SCHEDULE_TIME_ZONE
 from ffml.models import predict, train
 from ffml.utils.io import ensure_directory, read_parquet, resolve_path
 
 logger = logging.getLogger(__name__)
+
+# The predict_week.py flag that bypasses the kickoff check on purpose. It is
+# named in the check's failure message so the bypass is found by choosing it.
+ALLOW_KICKED_OFF_FLAG = "--allow-kicked-off"
 
 # The raw tables whose age decides whether a projection may run.
 AGED_TABLES = ["schedules", "injuries", "rosters_weekly"]
@@ -154,6 +161,78 @@ def check_freshness(config: dict[str, Any], season: int, week: int, now: datetim
             f"The data is not fresh enough to project {season} week {week}:\n  " + "\n  ".join(problems)
         )
     return inputs
+
+
+def kicked_off_games(sides: pd.DataFrame, now: pd.Timestamp) -> tuple[int, int]:
+    """Count this week's games that have already kicked off.
+
+    Takes the target week's game sides, with kickoff as a naive US Eastern
+    timestamp, and the current time as a naive US Eastern timestamp. Returns the
+    number of games kicked off and the number of games this week.
+
+    Each game has two team sides, so games are counted once by id. A game with
+    no recorded kickoff time does not count as kicked off. The comparison is the
+    one the kickoff passed flag on each projected row uses.
+    """
+    games = sides.drop_duplicates(subset=["game_id"])
+    kickoffs = games["kickoff"]
+    passed = kickoffs.notna() & (kickoffs <= now)
+    return int(passed.sum()), len(games)
+
+
+def kickoff_problems(kicked_off: int, games: int, season: int, week: int, max_share: float) -> list[str]:
+    """Report a week in which too many games have already kicked off to project it.
+
+    Takes the games kicked off, the games this week, the season and week, and
+    the largest share of games that may have kicked off. Returns the problems,
+    empty when the run is early enough. A week with no games returns nothing,
+    because the freshness checks already report a schedule with no games.
+
+    A projection for a game already played looks exactly like a forecast, so a
+    run that is too late fails rather than warns. A few kicked-off games are
+    normal for a late-week run: Thursday's game, and in holiday weeks Christmas
+    and Saturday games. The limit in config is set between those and a run made
+    after the Sunday early games start.
+    """
+    if games == 0:
+        return []
+    share = kicked_off / games
+    if share <= max_share:
+        return []
+    return [
+        f"{kicked_off} of {games} games in {season} week {week} have already kicked off ({share:.0%}), over the "
+        f"{max_share:.0%} limit, so this run would project games already played. For a deliberate retrospective "
+        f"run, use scripts/predict_week.py {ALLOW_KICKED_OFF_FLAG}; such a run is never logged."
+    ]
+
+
+def kickoff_counts(config: dict[str, Any], season: int, week: int, now: pd.Timestamp | None = None) -> tuple[int, int]:
+    """Count the target week's games that have already kicked off, from the schedule on disk.
+
+    Takes the parsed config, the target season and week, and optionally the
+    current time as a naive US Eastern timestamp. Returns the number of games
+    kicked off and the number of games this week.
+    """
+    if now is None:
+        # Kickoffs are read as US Eastern, so now is taken in the same zone.
+        now = pd.Timestamp.now(tz=SCHEDULE_TIME_ZONE).tz_localize(None)
+    schedules = read_parquet(resolve_path(config["data"]["paths"]["raw"]) / "schedules.parquet")
+    return kicked_off_games(predict.game_sides(schedules, season, week), now)
+
+
+def check_kickoff(config: dict[str, Any], season: int, week: int, now: pd.Timestamp | None = None) -> tuple[int, int]:
+    """Refuse to project a week in which too many games have already kicked off.
+
+    Takes the parsed config, the target season and week, and optionally the
+    current time as a naive US Eastern timestamp. Returns the number of games
+    kicked off and the number of games this week. Raises ValueError when the
+    share kicked off is over weekly.max_kicked_off_share.
+    """
+    kicked_off, games = kickoff_counts(config, season, week, now)
+    problems = kickoff_problems(kicked_off, games, season, week, config["weekly"]["max_kicked_off_share"])
+    if len(problems) > 0:
+        raise ValueError(problems[0])
+    return kicked_off, games
 
 
 def log_directory(config: dict[str, Any]) -> Path:

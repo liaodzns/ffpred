@@ -38,7 +38,7 @@ from ffml.config import ConfigError, load_config
 from ffml.features import build_dataset
 from ffml.features.rolling import rolling_feature_name
 from ffml.models import baseline, evaluate, predict, quantiles, train, tune
-from ffml.utils.io import read_parquet, resolve_path
+from ffml.utils.io import read_parquet, resolve_path, use_utf8_output
 
 # Columns the evaluation groups by when breaking results out.
 METADATA_COLUMNS = ["position", "week", "season"]
@@ -689,6 +689,7 @@ def main() -> int:
 
     Takes nothing. Returns a process exit code, 0 on success.
     """
+    use_utf8_output()
     arguments = parse_arguments()
 
     try:

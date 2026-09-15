@@ -651,6 +651,16 @@ weekly:
   # the week can miss the Friday game designations that rule players out.
   max_data_age_hours: 24
 
+  # Every non-smoke predict_week.py run, and scripts/weekly.py, refuse to project a
+  # week in which more than this share of games has already kicked off. Such a run
+  # projects finished games, and its output looks normal. predict_week.py
+  # --allow-kicked-off bypasses it on purpose, and such a run can never be logged.
+  # Measured on the 2022-24 schedule calendar (54 weeks): just before the first
+  # slate of five or more games, at most 6 of 16 had kicked off (37.5%, 2024 week
+  # 17, Christmas week), usually 1 or 2. Once that slate kicks off, at least 8 of 16
+  # had (50%). 0.40 sits in the gap between a legitimate late run and a late one.
+  max_kicked_off_share: 0.40
+
   # Every projection run is logged here with its time, so actual results can be
   # joined against what was projected before kickoff. Logs are never overwritten.
   log_directory: data/predictions/log
