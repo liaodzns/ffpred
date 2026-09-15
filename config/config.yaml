@@ -607,6 +607,56 @@ predict:
 
 
 # ----------------------------------------------------------------------------
+# Start/sit comparison for my own roster
+#
+# scripts/start_sit.py and scripts/weekly.py rank the players in roster_file by
+# position. Nothing here changes a projection; it only decides how they are read.
+# ----------------------------------------------------------------------------
+start_sit:
+  # Hand-maintained, one player per line; see config/roster.example.txt. The
+  # real file stays out of git.
+  roster_file: config/roster.txt
+
+  # Earlier name-to-id resolutions, re-verified against the current roster on
+  # every run.
+  roster_cache: data/processed/roster_ids.json
+
+  # The yardstick for a close call: if the top two players at a position are
+  # within one of these of each other, the model does not distinguish them.
+  # Copied from the shipped MAE column of CLAUDE.md's stated performance table,
+  # ten seeds on the pooled 2023 and 2024 walk-forward folds. Do not replace
+  # them with a new statistic; update them only when that table changes.
+  distinguishing_mae:
+    QB: 6.9807
+    RB: 4.7552
+    WR: 4.7414
+    TE: 3.6150
+
+  # How much the projection has earned at each position, printed with every
+  # comparison. Copied from the same stated performance table, not written fresh.
+  trust_notes:
+    QB: "Ships the baseline: the QB model never beat a three-game average (MAE 6.8577 vs 6.9807, t -1.00)."
+    RB: "Model beats the baseline, narrowly (MAE 4.7552 vs 4.8937, t -2.39)."
+    WR: "Model beats the baseline clearly (MAE 4.7414 vs 4.9211, t -3.96)."
+    TE: "Model beats the baseline clearly (MAE 3.6150 vs 3.8705, t -5.01)."
+
+
+# ----------------------------------------------------------------------------
+# Weekly operation
+# ----------------------------------------------------------------------------
+weekly:
+  # scripts/weekly.py and predict_week.py --require-fresh refuse to project if the
+  # schedule, injury report, or weekly roster were pulled longer ago than this.
+  # A projection is a pre-kickoff decision, and a day-old injury report late in
+  # the week can miss the Friday game designations that rule players out.
+  max_data_age_hours: 24
+
+  # Every projection run is logged here with its time, so actual results can be
+  # joined against what was projected before kickoff. Logs are never overwritten.
+  log_directory: data/predictions/log
+
+
+# ----------------------------------------------------------------------------
 # Logging
 # ----------------------------------------------------------------------------
 logging:

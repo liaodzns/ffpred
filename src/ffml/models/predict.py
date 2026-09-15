@@ -1368,6 +1368,7 @@ def run_prediction(
 
     return {
         "output": output,
+        "candidates": candidates,
         "distribution": distribution,
         "exclusions": exclusion_counts(candidates, output),
         "rookies_without_games": count_active_rookies(candidates),

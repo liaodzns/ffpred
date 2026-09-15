@@ -1,0 +1,19 @@
+# My fantasy roster, one player per line.
+#
+# Copy this file to config/roster.txt, which stays out of git, and edit that copy.
+#
+# Type names the way you would say them. Punctuation, accents, and suffixes such as
+# Jr. do not matter: "AJ Brown" and "A.J. Brown" both work.
+#
+# If a name belongs to more than one player on a current NFL roster, the run stops
+# and lists the candidates. Add a hint after a vertical bar to choose one: a
+# position, a team, or both.
+#
+# Anything after "#" is a comment.
+
+Justin Herbert
+Jahmyr Gibbs
+Jaxon Smith-Njigba
+AJ Brown
+Trey McBride
+Mike Williams | WR PIT   # a hint, only needed when a name is ambiguous

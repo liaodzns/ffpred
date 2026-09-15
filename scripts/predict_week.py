@@ -15,8 +15,10 @@ import sys
 
 import pandas as pd
 
+from ffml import weekly
 from ffml.config import ConfigError, load_config
 from ffml.data import ingest
+from ffml.data.clean import SCHEDULE_TIME_ZONE
 from ffml.models import predict
 
 # How many players per position the eyeball check prints.
@@ -41,6 +43,19 @@ def parse_arguments() -> argparse.Namespace:
         "--allow-incomplete-history",
         action="store_true",
         help="Project even if last week's games or stats have not all arrived; flags affected players.",
+    )
+    parser.add_argument(
+        "--require-fresh",
+        action="store_true",
+        help=(
+            "Refuse to project unless the schedule, last week's results, the injury report, the weekly "
+            "roster, and every betting line are current. scripts/weekly.py always sets this."
+        ),
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Log this run's projections and candidates with its time, for in-season scoring. Never overwrites.",
     )
     return parser.parse_args()
 
@@ -201,11 +216,25 @@ def main() -> int:
         return 1
 
     configure_logging(config)
+    if arguments.smoke_test and arguments.log:
+        print("Cannot log a smoke test: its models trained on the week, so it is not a forecast.", file=sys.stderr)
+        return 1
+
     try:
         season, week = resolve_target(arguments, config)
+        if arguments.require_fresh:
+            weekly.check_freshness(config, season, week)
         result = predict.run_prediction(
             config, season, week, arguments.smoke_test, arguments.allow_incomplete_history
         )
+        if arguments.log:
+            # Logged in US Eastern, the time zone kickoffs are read in, so the
+            # scorer can tell which projections were made before each game.
+            logged_at = pd.Timestamp.now(tz=SCHEDULE_TIME_ZONE).tz_localize(None).to_pydatetime()
+            projections_log, _ = weekly.write_projection_log(
+                result, weekly.log_directory(config), season, week, logged_at
+            )
+            print(f"Logged this run to {projections_log}")
     except ValueError as error:
         print("Cannot project: " + str(error), file=sys.stderr)
         return 1
